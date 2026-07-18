@@ -8,7 +8,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import confetti from 'canvas-confetti';
 import { ethers } from 'ethers';
 import { 
-  useAccount, useConnect, useDisconnect, useWriteContract
+  useAccount, useConnect, useDisconnect, useWriteContract, usePublicClient
 } from 'wagmi';
 import { injected } from 'wagmi/connectors';
 
@@ -245,6 +245,16 @@ export default function App() {
 
   // Wagmi Write Contract Hook
   const { writeContractAsync } = useWriteContract();
+  const publicClient = usePublicClient();
+
+  // writeContractAsync only resolves once the wallet returns a tx hash, not once the
+  // tx is mined. Every flow below (commit/reveal timing, refetching domains after a
+  // mint) depends on the tx actually being confirmed first, so we wait on the receipt
+  // before moving to the next step.
+  const waitForTx = async (hash: `0x${string}`) => {
+    if (!publicClient) return;
+    await publicClient.waitForTransactionReceipt({ hash });
+  };
 
   const [isRenewing, setIsRenewing] = useState<string | null>(null);
 
@@ -258,13 +268,15 @@ export default function App() {
       const priceWei = await controller.price(name, 31536000); // 1 year renewal
 
       showSuccess(`Please approve the renewal transaction for ${name}.arc in your wallet...`);
-      await writeContractAsync({
+      const tx = await writeContractAsync({
         address: CONTROLLER_ADDRESS,
         abi: CONTROLLER_ABI,
         functionName: 'renew',
         args: [name, 31536000],
         value: BigInt(priceWei.toString()) // Paid in native USDC gas token (18 decimals)
       });
+      showSuccess('Confirming renewal on-chain...');
+      await waitForTx(tx);
       showSuccess(`Successfully renewed ${name}.arc for 1 year!`);
       fetchDomainsAndListings();
     } catch (err: any) {
@@ -469,6 +481,12 @@ export default function App() {
         args: [hash]
       });
 
+      // Wait for the commit to actually be mined before starting the countdown.
+      // minCommitAge/maxCommitAge are enforced against the mined block timestamp,
+      // not against when the wallet returned this hash.
+      showSuccess('Waiting for commitment to confirm on-chain...');
+      await waitForTx(tx);
+
       setActiveCommitment(prev => prev ? {
         ...prev,
         step: 'waiting',
@@ -476,7 +494,7 @@ export default function App() {
         txHash: tx
       } : null);
 
-      showSuccess('Commitment successfully submitted! Beginning 60s maturity countdown...');
+      showSuccess('Commitment confirmed! Beginning 60s maturity countdown...');
     } catch (err: any) {
       console.error('Commit failed:', err);
       setActiveCommitment(null);
@@ -508,6 +526,9 @@ export default function App() {
         ],
         value: BigInt(priceWei.toString()) // Paid in native USDC gas token (18 decimals)
       });
+
+      showSuccess('Confirming registration on-chain...');
+      await waitForTx(tx);
 
       confetti({ particleCount: 200, spread: 80, origin: { y: 0.6 } });
       showSuccess(`Successfully registered ${activeCommitment.name}.arc!`);
@@ -916,23 +937,25 @@ export default function App() {
       // Update primary address record
       if (recordAddr) {
         showSuccess('Please approve the address configuration transaction...');
-        await writeContractAsync({
+        const addrTx = await writeContractAsync({
           address: RESOLVER_ADDRESS,
           abi: RESOLVER_ABI,
           functionName: 'setAddr',
           args: [node, recordAddr]
         });
+        await waitForTx(addrTx);
       }
 
       // Update description text record
       if (recordDesc) {
         showSuccess('Please approve the profile description transaction...');
-        await writeContractAsync({
+        const descTx = await writeContractAsync({
           address: RESOLVER_ADDRESS,
           abi: RESOLVER_ABI,
           functionName: 'setText',
           args: [node, 'description', recordDesc]
         });
+        await waitForTx(descTx);
       }
 
       showSuccess('Records successfully configured on-chain!');
@@ -967,21 +990,23 @@ export default function App() {
 
       if (approvedAddress.toLowerCase() !== MARKET_ADDRESS.toLowerCase()) {
         showSuccess('Please approve the marketplace listing permission first...');
-        await writeContractAsync({
+        const approveTx = await writeContractAsync({
           address: REGISTRAR_ADDRESS,
           abi: REGISTRAR_ABI,
           functionName: 'approve',
           args: [MARKET_ADDRESS, id]
         });
+        await waitForTx(approveTx);
       }
 
       showSuccess('Please approve the secondary marketplace listing transaction...');
-      await writeContractAsync({
+      const listTx = await writeContractAsync({
         address: MARKET_ADDRESS,
         abi: MARKET_ABI,
         functionName: 'list',
         args: [id, priceWei]
       });
+      await waitForTx(listTx);
 
       showSuccess(`Domain ${isListingToken}.arc listed for ${listingPrice} USDC!`);
       setIsListingToken(null);
@@ -998,12 +1023,13 @@ export default function App() {
     try {
       const id = labelToId(name);
       showSuccess('Please approve the listing cancellation transaction...');
-      await writeContractAsync({
+      const unlistTx = await writeContractAsync({
         address: MARKET_ADDRESS,
         abi: MARKET_ABI,
         functionName: 'unlist',
         args: [id]
       });
+      await waitForTx(unlistTx);
       showSuccess(`Domain ${name}.arc has been successfully unlisted.`);
       fetchDomainsAndListings();
     } catch (err: any) {
@@ -1016,13 +1042,15 @@ export default function App() {
     try {
       const priceWei = ethers.parseEther(listing.price);
       showSuccess(`Purchasing ${listing.name}.arc for ${listing.price} USDC...`);
-      await writeContractAsync({
+      const buyTx = await writeContractAsync({
         address: MARKET_ADDRESS,
         abi: MARKET_ABI,
         functionName: 'buy',
         args: [listing.id, priceWei],
         value: priceWei // Paid in native USDC (18 decimals)
       });
+      showSuccess('Confirming purchase on-chain...');
+      await waitForTx(buyTx);
       confetti({ particleCount: 150, spread: 80 });
       showSuccess(`Congratulations! You are the new owner of ${listing.name}.arc.`);
       fetchDomainsAndListings();
