@@ -1,0 +1,6 @@
+{
+  "name": "Arc Domain Registry",
+  "description": "Claim, manage, and trade your decentralized .arc web3 domains.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
