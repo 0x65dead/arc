@@ -83,7 +83,6 @@ export function parseRevertReason(err: any): string {
   if (!err) return 'Unknown error occurred.';
   const message = err.message || '';
   
-  // Try to find a revert reason like "!owner" or "!minted"
   if (message.includes('!owner')) return 'Error: Not the owner of this domain.';
   if (message.includes('!minted')) return 'Error: Domain has not been minted.';
   if (message.includes('early')) return 'Error: Commitment is too young. Please wait for the 60-second delay.';
@@ -192,9 +191,22 @@ export default function App() {
     seller: string;
     isUSDCListing: boolean;
   }>>([]);
+  
+  // User Domains state
+  const [userDomains, setUserDomains] = useState<Array<{
+    name: string;
+    id: string;
+    owner: string;
+    expiry: number;
+    svgUrl: string;
+    resolvedAddress?: string;
+  }>>([]);
+  const [isLoadingDomains, setIsLoadingDomains] = useState(false);
+
+  // Listing states
   const [isListingToken, setIsListingToken] = useState<string | null>(null);
   const [listingPrice, setListingPrice] = useState('');
-  const [isSubmittingListing, setIsUpdatingListing] = useState(false);
+  const [isSubmittingListing, setIsSubmittingListing] = useState(false);
 
   // Wagmi Write Contract Hook
   const { writeContractAsync } = useWriteContract();
@@ -483,16 +495,6 @@ export default function App() {
   };
 
   // --- Fetch Marketplace and User Domains ---
-  const [userDomains, setUserDomains] = useState<Array<{
-    name: string;
-    id: string;
-    owner: string;
-    expiry: number;
-    svgUrl: string;
-    resolvedAddress?: string;
-  }>>([]);
-  const [isLoadingDomains, setIsLoadingDomains] = useState(false);
-
   const fetchDomainsAndListings = async () => {
     setIsLoadingDomains(true);
 
@@ -868,7 +870,7 @@ export default function App() {
 
   const submitListing = async () => {
     if (!isListingToken || !listingPrice) return;
-    setIsUpdatingListing(true);
+    setIsSubmittingListing(true);
 
     try {
       const id = labelToId(isListingToken);
@@ -904,7 +906,7 @@ export default function App() {
       console.error(err);
       showError(parseRevertReason(err));
     } finally {
-      setIsUpdatingListing(false);
+      setIsSubmittingListing(false);
     }
   };
 
