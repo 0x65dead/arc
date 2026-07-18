@@ -558,9 +558,12 @@ export default function App() {
 
       const discoveredNames = new Set<string>(DEFAULT_TRACKED_DOMAINS);
       const registeredNamesCount = new Set<string>();
+      // Hoisted out of the try block below so the revenue-summing block can reuse it
+      // without re-fetching the same NameRegistered logs a second time.
+      let registeredLogs: ethers.Log[] = [];
 
       try {
-        const registeredLogs = await fetchLogsWithChunking(
+        registeredLogs = await fetchLogsWithChunking(
           provider,
           {
             address: CONTROLLER_ADDRESS,
@@ -589,12 +592,45 @@ export default function App() {
         console.warn('Failed to fetch NameRegistered logs:', logErr);
       }
 
-      // Fetch on-chain total USDC balance of the ArcController contract to show total revenue
+      // TOTAL REVENUE = lifetime gross volume, i.e. the sum of 'cost' across every
+      // NameRegistered + NameRenewed event. Reading the contract's live USDC balance
+      // instead would undercount as soon as the owner withdraws funds, so we sum the
+      // historical event stream rather than reading current treasury state.
       let totalRevenueWei = 0n;
       try {
-        totalRevenueWei = await provider.getBalance(CONTROLLER_ADDRESS);
+        registeredLogs.forEach(log => {
+          try {
+            const parsed = controllerInterface.parseLog(log);
+            if (parsed) {
+              totalRevenueWei += BigInt(parsed.args.cost.toString());
+            }
+          } catch (e) {
+            // Already warned above during discovery pass; skip.
+          }
+        });
+
+        const renewedLogs = await fetchLogsWithChunking(
+          provider,
+          {
+            address: CONTROLLER_ADDRESS,
+            topics: [ethers.id("NameRenewed(string,bytes32,uint256,uint256)")]
+          },
+          DEPLOY_BLOCK,
+          latestBlock
+        );
+
+        renewedLogs.forEach(log => {
+          try {
+            const parsed = controllerInterface.parseLog(log);
+            if (parsed) {
+              totalRevenueWei += BigInt(parsed.args.cost.toString());
+            }
+          } catch (e) {
+            console.warn('Failed to parse NameRenewed log:', e);
+          }
+        });
       } catch (err) {
-        console.warn('Failed to fetch controller balance:', err);
+        console.warn('Failed to sum revenue from events:', err);
       }
 
       const formattedRevenue = parseFloat(ethers.formatEther(totalRevenueWei));
