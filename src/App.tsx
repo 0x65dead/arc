@@ -20,6 +20,9 @@ const MARKET_ADDRESS = '0xC94Ff1964840BdF8E6952455a2342Ffc6B0bA299';
 const REGISTRY_ADDRESS = '0xCA78696791670CbC14eE802e6DcDfD661a458978';
 const UNIVERSAL_RESOLVER_ADDRESS = '0xA3F364a558eb712AFbB4929df49e538A800438BC';
 
+// Block from which we start indexing on-chain events (contract deployment block)
+const DEPLOY_BLOCK = 52346600;
+
 // --- Simplified ABIs for on-chain calls ---
 const CONTROLLER_ABI = [
   'function available(string calldata nm) external view returns (bool)',
@@ -72,6 +75,38 @@ export function namehash(name: string): string {
 export function labelToId(label: string): string {
   const hash = ethers.keccak256(ethers.toUtf8Bytes(label));
   return BigInt(hash).toString();
+}
+
+// Fetch logs in bounded-size chunks to stay under RPC provider block-range caps.
+// On a chunk failure we stop and return whatever was collected so far rather than
+// throwing, matching this file's existing warn-and-continue error handling style.
+async function fetchLogsWithChunking(
+  provider: ethers.JsonRpcProvider,
+  filter: { address: string; topics: any[] },
+  startBlock: number,
+  endBlock: number,
+  chunkSize: number = 10000
+): Promise<ethers.Log[]> {
+  let currentBlock = startBlock;
+  let allLogs: ethers.Log[] = [];
+
+  while (currentBlock <= endBlock) {
+    const chunkEndBlock = Math.min(currentBlock + chunkSize - 1, endBlock);
+    try {
+      const logs = await provider.getLogs({
+        ...filter,
+        fromBlock: currentBlock,
+        toBlock: chunkEndBlock,
+      });
+      allLogs = allLogs.concat(logs);
+    } catch (err) {
+      console.warn(`Failed to fetch logs for blocks ${currentBlock}-${chunkEndBlock}:`, err);
+      // Stop rather than looping forever; caller receives the partial result collected so far.
+      break;
+    }
+    currentBlock = chunkEndBlock + 1;
+  }
+  return allLogs;
 }
 
 // Pre-seeded list of domains to look up or list in the market/explore view
@@ -501,6 +536,10 @@ export default function App() {
     try {
       const provider = new ethers.JsonRpcProvider('https://rpc.testnet.arc.network');
 
+      // Resolve the current chain head once and reuse it for every chunked scan below,
+      // instead of re-querying per log fetch.
+      const latestBlock = await provider.getBlockNumber();
+
       const listResults: typeof userDomains = [];
       const marketResults: typeof marketplaceListings = [];
 
@@ -521,14 +560,16 @@ export default function App() {
       const registeredNamesCount = new Set<string>();
 
       try {
-        const registeredFilter = {
-          address: CONTROLLER_ADDRESS,
-          topics: [ethers.id("NameRegistered(string,bytes32,address,uint256,uint256)")],
-          fromBlock: 52346600,
-          toBlock: 'latest'
-        };
-        const registeredLogs = await provider.getLogs(registeredFilter);
-        
+        const registeredLogs = await fetchLogsWithChunking(
+          provider,
+          {
+            address: CONTROLLER_ADDRESS,
+            topics: [ethers.id("NameRegistered(string,bytes32,address,uint256,uint256)")]
+          },
+          DEPLOY_BLOCK,
+          latestBlock
+        );
+
         registeredLogs.forEach(log => {
           try {
             const parsed = controllerInterface.parseLog(log);
@@ -562,16 +603,18 @@ export default function App() {
       // Fetch on-chain total Transfer logs from zero address to compute exact minted count
       let mintsCount = 0;
       try {
-        const mintFilter = {
-          address: REGISTRAR_ADDRESS,
-          topics: [
-            ethers.id("Transfer(address,address,uint256)"),
-            ethers.zeroPadValue(ethers.ZeroAddress, 32)
-          ],
-          fromBlock: 52346600,
-          toBlock: 'latest'
-        };
-        const mintLogs = await provider.getLogs(mintFilter);
+        const mintLogs = await fetchLogsWithChunking(
+          provider,
+          {
+            address: REGISTRAR_ADDRESS,
+            topics: [
+              ethers.id("Transfer(address,address,uint256)"),
+              ethers.zeroPadValue(ethers.ZeroAddress, 32)
+            ]
+          },
+          DEPLOY_BLOCK,
+          latestBlock
+        );
         mintsCount = mintLogs.length;
       } catch (mintErr) {
         console.warn('Failed to fetch Transfer (mint) logs:', mintErr);
@@ -590,12 +633,15 @@ export default function App() {
 
       // Reconstruct Marketplace active listings by reading listings mapping from the contract
       try {
-        const listedLogs = await provider.getLogs({
-          address: MARKET_ADDRESS,
-          topics: [ethers.id("Listed(uint256,address,uint256)")],
-          fromBlock: 52346600,
-          toBlock: 'latest'
-        });
+        const listedLogs = await fetchLogsWithChunking(
+          provider,
+          {
+            address: MARKET_ADDRESS,
+            topics: [ethers.id("Listed(uint256,address,uint256)")]
+          },
+          DEPLOY_BLOCK,
+          latestBlock
+        );
 
         const uniqueTokenIds = new Set<string>();
         listedLogs.forEach(log => {
@@ -653,17 +699,19 @@ export default function App() {
       if (isConnected && address) {
         try {
           const paddedAddress = ethers.zeroPadValue(address, 32);
-          const transferFilter = {
-            address: REGISTRAR_ADDRESS,
-            topics: [
-              ethers.id("Transfer(address,address,uint256)"),
-              null,
-              paddedAddress
-            ],
-            fromBlock: 52346600,
-            toBlock: 'latest'
-          };
-          const transferLogs = await provider.getLogs(transferFilter);
+          const transferLogs = await fetchLogsWithChunking(
+            provider,
+            {
+              address: REGISTRAR_ADDRESS,
+              topics: [
+                ethers.id("Transfer(address,address,uint256)"),
+                null,
+                paddedAddress
+              ]
+            },
+            DEPLOY_BLOCK,
+            latestBlock
+          );
           
           // Create a set to ensure a user doesn't have duplicate entries if transferred multiple times
           const ownedTokenIds = new Set<string>();
