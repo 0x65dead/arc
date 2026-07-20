@@ -11,6 +11,7 @@ import {
   useAccount, useConnect, useDisconnect, useWriteContract, usePublicClient
 } from 'wagmi';
 import { injected } from 'wagmi/connectors';
+import { parseAbi } from 'viem';
 
 // --- Deployment Addresses ---
 const CONTROLLER_ADDRESS = '0x2FE2560B2FE6D54e50806F531223247CcfEd739B';
@@ -24,7 +25,7 @@ const UNIVERSAL_RESOLVER_ADDRESS = '0xA3F364a558eb712AFbB4929df49e538A800438BC';
 const DEPLOY_BLOCK = 52346600;
 
 // --- Simplified ABIs for on-chain calls ---
-const CONTROLLER_ABI = [
+const CONTROLLER_ABI = parseAbi([
   'function available(string calldata nm) external view returns (bool)',
   'function valid(string calldata nm) external view returns (bool)',
   'function price(string memory nm, uint256 dur) public view returns (uint256)',
@@ -32,16 +33,16 @@ const CONTROLLER_ABI = [
   'function commit(bytes32 c) external',
   'function register(string calldata nm, address o, uint256 dur, bytes32 s) external payable',
   'function renew(string calldata nm, uint256 dur) external payable'
-];
+]);
 
-const RESOLVER_ABI = [
+const RESOLVER_ABI = parseAbi([
   'function addr(bytes32 node) external view returns (address)',
   'function text(bytes32 node, string calldata key) external view returns (string memory)',
   'function setAddr(bytes32 node, address a) external',
   'function setText(bytes32 node, string calldata key, string calldata value) external'
-];
+]);
 
-const REGISTRAR_ABI = [
+const REGISTRAR_ABI = parseAbi([
   'function ownerOf(uint256 id) external view returns (address)',
   'function tokenURI(uint256 id) external view returns (string memory)',
   'function labels(uint256 id) external view returns (string memory)',
@@ -50,15 +51,15 @@ const REGISTRAR_ABI = [
   'function approve(address to, uint256 id) external',
   'function getApproved(uint256 id) external view returns (address)',
   'function nameExpires(uint256 id) external view returns (uint256)'
-];
+]);
 
-const MARKET_ABI = [
+const MARKET_ABI = parseAbi([
   'function listings(uint256 id) external view returns (address seller, uint256 price)',
   'function listingCurrency(uint256 id) external view returns (uint8)',
   'function list(uint256 id, uint256 price) external',
   'function unlist(uint256 id) external',
   'function buy(uint256 id, uint256 maxPrice) external payable'
-];
+]);
 
 // --- Custom Name Hash Helpers ---
 export function namehash(name: string): string {
