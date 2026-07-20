@@ -273,7 +273,7 @@ export default function App() {
         address: CONTROLLER_ADDRESS,
         abi: CONTROLLER_ABI,
         functionName: 'renew',
-        args: [name, 31536000],
+        args: [name, 31536000n],
         value: BigInt(priceWei.toString()) // Paid in native USDC gas token (18 decimals)
       });
       showSuccess('Confirming renewal on-chain...');
@@ -532,9 +532,9 @@ export default function App() {
         functionName: 'register',
         args: [
           activeCommitment.name,
-          activeCommitment.owner,
-          31536000, // 1 year duration
-          activeCommitment.secret
+          activeCommitment.owner as `0x${string}`,
+          31536000n, // 1 year duration
+          activeCommitment.secret as `0x${string}`
         ],
         value: BigInt(priceWei.toString()) // Paid in native USDC gas token (18 decimals)
       });
@@ -953,7 +953,7 @@ export default function App() {
           address: RESOLVER_ADDRESS,
           abi: RESOLVER_ABI,
           functionName: 'setAddr',
-          args: [node, recordAddr]
+          args: [node as `0x${string}`, recordAddr as `0x${string}`]
         });
         await waitForTx(addrTx);
       }
@@ -965,7 +965,7 @@ export default function App() {
           address: RESOLVER_ADDRESS,
           abi: RESOLVER_ABI,
           functionName: 'setText',
-          args: [node, 'description', recordDesc]
+          args: [node as `0x${string}`, 'description', recordDesc]
         });
         await waitForTx(descTx);
       }
@@ -1006,7 +1006,7 @@ export default function App() {
           address: REGISTRAR_ADDRESS,
           abi: REGISTRAR_ABI,
           functionName: 'approve',
-          args: [MARKET_ADDRESS, id]
+          args: [MARKET_ADDRESS, BigInt(id)]
         });
         await waitForTx(approveTx);
       }
@@ -1016,7 +1016,7 @@ export default function App() {
         address: MARKET_ADDRESS,
         abi: MARKET_ABI,
         functionName: 'list',
-        args: [id, priceWei]
+        args: [BigInt(id), priceWei]
       });
       await waitForTx(listTx);
 
@@ -1039,7 +1039,7 @@ export default function App() {
         address: MARKET_ADDRESS,
         abi: MARKET_ABI,
         functionName: 'unlist',
-        args: [id]
+        args: [BigInt(id)]
       });
       await waitForTx(unlistTx);
       showSuccess(`Domain ${name}.arc has been successfully unlisted.`);
@@ -1058,7 +1058,7 @@ export default function App() {
         address: MARKET_ADDRESS,
         abi: MARKET_ABI,
         functionName: 'buy',
-        args: [listing.id, priceWei],
+        args: [BigInt(listing.id), priceWei],
         value: priceWei // Paid in native USDC (18 decimals)
       });
       showSuccess('Confirming purchase on-chain...');
