@@ -506,6 +506,17 @@ export default function App() {
   const triggerRegister = async () => {
     if (!activeCommitment || !address) return;
 
+    // The commitment hash was computed on-chain from activeCommitment.owner at commit
+    // time. If the wallet has since switched accounts (or this commitment was reloaded
+    // from localStorage after reconnecting as a different account), registering with
+    // the live `address` would produce a different hash than what was committed and
+    // revert with "commit expired" instead of actually registering.
+    if (address.toLowerCase() !== activeCommitment.owner.toLowerCase()) {
+      showError('Connected wallet has changed since you committed this name. Please reconnect the original account and try again.');
+      setActiveCommitment(prev => prev ? { ...prev, step: 'ready' } : null);
+      return;
+    }
+
     try {
       setActiveCommitment(prev => prev ? { ...prev, step: 'registering' } : null);
       showSuccess('Estimating cost and preparing registration transaction...');
@@ -520,7 +531,7 @@ export default function App() {
         functionName: 'register',
         args: [
           activeCommitment.name,
-          address,
+          activeCommitment.owner,
           31536000, // 1 year duration
           activeCommitment.secret
         ],
@@ -1331,15 +1342,6 @@ export default function App() {
                           <p className="text-xs text-[#7E9384] text-center font-mono animate-pulse">
                             Preventing front-running on-chain. Please wait 60 seconds...
                           </p>
-                          <button
-                         onClick={() => {
-                              // Bypass only for debugging/developer comfort, standard flow expects 60s
-                              setActiveCommitment(prev => prev ? { ...prev, step: 'ready' } : null);
-                            }}
-                            className="w-full border border-[#7E9384]/20 hover:border-[#7DFF66]/50 text-xs font-mono text-[#7E9384] py-2 rounded-lg"
-                          >
-                            Skip waiting delay (Developer Mode)
-                          </button>
                         </div>
                       ) : activeCommitment.step === 'ready' ? (
                         <button
