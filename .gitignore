@@ -1,3 +1,7 @@
+# Environment
 .env
-.env
-.env
+.env.local
+.env.*
+
+# Exception: .env.example files are meant to be committed as templates
+!**/.env.example
