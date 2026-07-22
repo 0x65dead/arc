@@ -1,3 +1,5 @@
+/// <reference types="vite/client" />
+
 // Base origin of the indexer service (see /indexer in this same delivery).
 // Set VITE_INDEXER_API_URL to the indexer's host, e.g. http://10.x.x.x:8787
 // or https://api.yourapp.com — with NO /api suffix. Every call below already

@@ -14,7 +14,7 @@ import { injected } from 'wagmi/connectors';
 import { parseAbi } from 'viem';
 import { useChainGuard, WrongChainError } from './hooks/useChainGuard';
 import {
-  fetchIndexerStats, fetchIndexerDomains, fetchIndexerMarketplace, fetchIndexerAvailability, fetchIndexerSyncStatus
+  fetchIndexerStats, fetchIndexerDomains, fetchIndexerMarketplace, fetchIndexerAvailability
 } from './lib/api';
 
 // --- Deployment Addresses ---
