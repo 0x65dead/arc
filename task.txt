@@ -1,0 +1,306 @@
+You are a senior full-stack blockchain engineer.
+
+You are working inside my local ARC repository. Analyze the entire repository before making changes. Read and understand:
+
+- src/
+- script/
+- test/
+- package.json
+- foundry.toml
+- README.md
+
+Do NOT make assumptions. Verify every claim against the codebase.
+
+==========================
+PRIMARY OBJECTIVE
+==========================
+
+Find and fix every issue related to domain registration, transaction handling, wallet chain validation, domain indexing, marketplace state, and statistics.
+
+This project is a Solidity + Foundry + React + TypeScript application.
+
+I want production-quality fixes.
+
+==========================
+BUG 1
+Incorrect statistics fallback
+==========================
+
+The app currently shows "13 registered names" even when the actual chain contains only a few registrations.
+
+Investigate the statistics calculation.
+
+If historical event loading fails, the UI must NEVER fabricate values using tracked names or fallback arrays.
+
+Instead:
+
+- return 0
+- or show "Unable to load"
+
+Do not silently substitute fake counts.
+
+==========================
+BUG 2
+Historical log scanning
+==========================
+
+Investigate every use of:
+
+getLogs()
+fetchDomainsAndListings()
+fetchLogsWithChunking()
+
+Current deployment block:
+
+52346600
+
+Current chain contains roughly 430k+ blocks.
+
+The frontend currently performs many sequential log scans which are unreliable.
+
+Requirements:
+
+- identify every historical scan
+- remove duplicated scans
+- improve retry logic
+- never silently ignore failures
+- surface errors clearly
+
+Do not stop after the first failed chunk.
+
+Collect diagnostics.
+
+==========================
+BUG 3
+Chain validation
+==========================
+
+Before ANY write transaction the app MUST verify the wallet is connected to:
+
+ARC Testnet
+Chain ID:
+5042002
+
+Implement a reusable helper.
+
+Every write operation must call it before writeContractAsync.
+
+Cover:
+
+- register
+- commit
+- renew
+- update records
+- list
+- cancel listing
+- buy
+
+If switching fails:
+
+show a user-friendly error
+
+DO NOT continue.
+
+==========================
+BUG 4
+Transaction success detection
+==========================
+
+Current waitForTx only waits for mining.
+
+This is incorrect.
+
+A reverted transaction is still mined.
+
+Implement:
+
+- receipt.status verification
+- throw TxRevertedError
+- propagate failures
+
+Update EVERY transaction flow.
+
+No success toast.
+
+No confetti.
+
+No cache refresh.
+
+No optimistic UI.
+
+Unless receipt.status == success.
+
+==========================
+BUG 5
+Revert reason extraction
+==========================
+
+Implement proper revert reason parsing.
+
+If receipt.status == reverted
+
+attempt simulation using viem
+
+Extract revert reason.
+
+Display meaningful errors.
+
+==========================
+BUG 6
+Marketplace refresh
+==========================
+
+Investigate stale marketplace state.
+
+Ensure successful transactions refresh:
+
+- listings
+- ownership
+- prices
+- balances
+
+without requiring manual reload.
+
+==========================
+BUG 7
+My Domains
+==========================
+
+Investigate why owned domains disappear.
+
+Trace ownership using Transfer events.
+
+Verify ownerOf.
+
+Verify registration events.
+
+Verify frontend filtering.
+
+Fix ownership detection.
+
+==========================
+BUG 8
+Domain availability
+==========================
+
+Investigate available(name).
+
+A successful registration must NEVER return available again.
+
+Trace:
+
+register()
+
+ownerOf()
+
+resolver
+
+controller
+
+frontend cache
+
+Refresh flow
+
+==========================
+LONG TERM ARCHITECTURE
+==========================
+
+Prepare the codebase for replacing browser log scans with an indexed backend.
+
+Do NOT remove current functionality.
+
+Instead abstract the data layer.
+
+Design APIs compatible with:
+
+GET /stats
+
+GET /domains
+
+GET /marketplace
+
+GET /owner/:address
+
+Future backend:
+
+Node.js
+
+Alchemy websocket
+
+Postgres/Supabase
+
+==========================
+DATABASE DESIGN
+==========================
+
+Design schemas for:
+
+registrations
+
+renewals
+
+transfers
+
+listings
+
+sales
+
+Each should include:
+
+tx hash
+
+block
+
+timestamp
+
+status
+
+owner
+
+name
+
+token id
+
+price (where applicable)
+
+==========================
+DELIVERABLES
+==========================
+
+1. Repository audit.
+
+2. Root cause analysis.
+
+3. Every bug found.
+
+4. Exact files modified.
+
+5. Full implementation.
+
+6. Why each fix works.
+
+7. Any remaining risks.
+
+8. Suggested future improvements.
+
+==========================
+IMPORTANT
+==========================
+
+Do not make cosmetic refactors.
+
+Do not rename files unnecessarily.
+
+Do not rewrite working code.
+
+Only modify code necessary to solve the problems.
+
+Preserve architecture where possible.
+
+Maintain TypeScript and Solidity best practices.
+
+Ensure the application builds successfully.
+
+Ensure Foundry tests continue passing.
+
+Output a detailed implementation report after completing the work.

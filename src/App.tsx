@@ -14,7 +14,7 @@ import { injected } from 'wagmi/connectors';
 import { parseAbi } from 'viem';
 import { useChainGuard, WrongChainError } from './hooks/useChainGuard';
 import {
-  fetchIndexerStats, fetchIndexerDomains, fetchIndexerMarketplace, fetchIndexerSyncStatus
+  fetchIndexerStats, fetchIndexerDomains, fetchIndexerMarketplace, fetchIndexerAvailability, fetchIndexerSyncStatus
 } from './lib/api';
 
 // --- Deployment Addresses ---
@@ -273,6 +273,10 @@ export default function App() {
   // missing entirely — previously a failed scan looked identical to a
   // successful one that happened to return real data.
   const [dataSourceWarning, setDataSourceWarning] = useState<string | null>(null);
+  // The exact reason the indexer calls failed, shown in the banner itself —
+  // so a fetch failure is diagnosable straight from the page on a phone,
+  // without needing to plug into a PC for devtools every time.
+  const [indexerErrorDetail, setIndexerErrorDetail] = useState<string | null>(null);
 
   // Marketplace states
   const [marketplaceListings, setMarketplaceListings] = useState<Array<{
@@ -439,23 +443,54 @@ export default function App() {
       const provider = new ethers.JsonRpcProvider('https://rpc.testnet.arc.network');
       const controller = new ethers.Contract(CONTROLLER_ADDRESS, CONTROLLER_ABI, provider);
 
-      const isAvailable = await controller.available(query);
+      // Price stays a live on-chain read regardless of indexer availability —
+      // it's a cheap, gas-free view call, and it's the contract's own
+      // pricing logic. Duplicating those tiers into the DB (or hardcoding
+      // them client-side) would just create a second place that can drift
+      // if the contract's pricing ever changes.
       const priceWei = await controller.price(query, 31536000); // 1 year
       const priceFormatted = ethers.formatEther(priceWei);
 
+      let isAvailable: boolean;
       let ownerAddress = '';
       let resolverAddress = '';
-      if (!isAvailable) {
-        try {
-          const registry = new ethers.Contract(REGISTRY_ADDRESS, [
-            'function owner(bytes32 node) view returns (address)',
-            'function resolver(bytes32 node) view returns (address)'
-          ], provider);
-          const node = namehash(`${query}.arc`);
-          ownerAddress = await registry.owner(node);
-          resolverAddress = await registry.resolver(node);
-        } catch (e) {
-          console.warn('Could not read owner/resolver:', e);
+
+      try {
+        // Indexer-first: answers instantly from Postgres instead of an RPC
+        // round-trip. This is a fast hint, not the final word — the actual
+        // register() transaction is still what enforces "not already taken"
+        // on-chain, so a few seconds of indexer lag (the live listener
+        // usually catches a new registration within seconds) can't cause a
+        // real double-registration — worst case is a revert at reveal time,
+        // which is already surfaced as a clear error, not silent failure.
+        const avail = await fetchIndexerAvailability(query);
+        isAvailable = !avail.taken;
+        if (avail.taken && avail.owner) {
+          ownerAddress = avail.owner;
+          try {
+            const registry = new ethers.Contract(REGISTRY_ADDRESS, [
+              'function resolver(bytes32 node) view returns (address)'
+            ], provider);
+            resolverAddress = await registry.resolver(namehash(`${query}.arc`));
+          } catch (e) {
+            console.warn('Could not read resolver record:', e);
+          }
+        }
+      } catch (indexerErr) {
+        console.warn('[ARC] indexer availability check failed, falling back to on-chain read:', indexerErr);
+        isAvailable = await controller.available(query);
+        if (!isAvailable) {
+          try {
+            const registry = new ethers.Contract(REGISTRY_ADDRESS, [
+              'function owner(bytes32 node) view returns (address)',
+              'function resolver(bytes32 node) view returns (address)'
+            ], provider);
+            const node = namehash(`${query}.arc`);
+            ownerAddress = await registry.owner(node);
+            resolverAddress = await registry.resolver(node);
+          } catch (e) {
+            console.warn('Could not read owner/resolver:', e);
+          }
         }
       }
 
@@ -904,15 +939,25 @@ export default function App() {
         marketResult.status === 'fulfilled';
 
       if (!indexerAvailable) {
-        console.warn(
-          '[ARC] indexer API unreachable, falling back to direct chain scan:',
-          statsResult.status === 'rejected' ? statsResult.reason : null,
-          domainsResult.status === 'rejected' ? domainsResult.reason : null,
-          marketResult.status === 'rejected' ? marketResult.reason : null
-        );
+        const reasons = [
+          ['stats', statsResult],
+          ['domains', domainsResult],
+          ['marketplace', marketResult]
+        ]
+          .filter(([, r]) => (r as PromiseSettledResult<unknown>).status === 'rejected')
+          .map(([label, r]) => {
+            const reason = (r as PromiseRejectedResult).reason;
+            const message = reason instanceof Error ? reason.message : String(reason);
+            return `${label}: ${message}`;
+          });
+
+        console.warn('[ARC] indexer API unreachable, falling back to direct chain scan:', reasons);
+        setIndexerErrorDetail(reasons.join(' — '));
         await fetchDomainsAndListingsFromChain();
         return;
       }
+
+      setIndexerErrorDetail(null);
 
       setDataSourceWarning(null);
 
@@ -1261,7 +1306,14 @@ export default function App() {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-4">
           <div className="flex items-start gap-3 bg-amber-400/5 border border-amber-400/20 rounded-xl p-3.5 text-xs font-mono text-amber-400">
             <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
-            <span>{dataSourceWarning}</span>
+            <div className="space-y-1 min-w-0">
+              <span>{dataSourceWarning}</span>
+              {indexerErrorDetail && (
+                <div className="text-[10px] text-amber-400/70 break-all">
+                  Debug: {indexerErrorDetail}
+                </div>
+              )}
+            </div>
           </div>
         </div>
       )}

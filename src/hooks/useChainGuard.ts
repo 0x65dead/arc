@@ -1,40 +1,39 @@
-import { useAccount, useSwitchChain } from 'wagmi';
 import { useCallback } from 'react';
+import { useAccount, useSwitchChain } from 'wagmi';
 
-const ARC_TESTNET_ID = 5042002;
+export const ARC_CHAIN_ID = 5042002;
 
+export class WrongChainError extends Error {
+  constructor(public currentChainId: number | undefined) {
+    super('Wallet is not on Arc Testnet');
+  }
+}
+
+/**
+ * Returns ensureCorrectChain(), which every write flow in App.tsx calls as
+ * its very first line. If the wallet is already on Arc Testnet this is a
+ * no-op; otherwise it asks the wallet to switch and only proceeds if that
+ * succeeds. This is the fix for the "Confirm Send — Network: Ethereum"
+ * screenshots: previously nothing checked the active chain before
+ * writeContractAsync fired, so a signature could be requested (and signed)
+ * on whatever network the wallet happened to have active.
+ */
 export function useChainGuard() {
-  const { chainId, isConnected } = useAccount();
-  const { switchChain } = useSwitchChain();
+  const { chain } = useAccount();
+  const { switchChainAsync } = useSwitchChain();
 
-  const ensureArcTestnet = useCallback(async () => {
-    if (!isConnected) {
-      throw new Error('Wallet not connected. Please connect your wallet first.');
+  const ensureCorrectChain = useCallback(async () => {
+    if (chain?.id === ARC_CHAIN_ID) return;
+
+    try {
+      await switchChainAsync({ chainId: ARC_CHAIN_ID });
+    } catch (err) {
+      // Wallet refused or doesn't support programmatic switching (some
+      // mobile wallet browsers don't). Surface a clear, typed error instead
+      // of letting the caller's writeContractAsync fire on the wrong chain.
+      throw new WrongChainError(chain?.id);
     }
+  }, [chain?.id, switchChainAsync]);
 
-    if (chainId !== ARC_TESTNET_ID) {
-      try {
-        await switchChain({ chainId: ARC_TESTNET_ID });
-      } catch (e: any) {
-        // Handle user rejection or other errors
-        if (e.message?.includes('rejected')) {
-          throw new Error('You rejected the network switch request.');
-        }
-        throw new Error(
-          `Please switch to Arc Testnet (Chain ID: ${ARC_TESTNET_ID}). Currently on chain ${chainId}. Some wallets require manual switching in settings.`
-        );
-      }
-    }
-  }, [isConnected, chainId, switchChain]);
-
-  const isOnCorrectChain = useCallback(() => {
-    return isConnected && chainId === ARC_TESTNET_ID;
-  }, [isConnected, chainId]);
-
-  return {
-    ensureArcTestnet,
-    isOnCorrectChain,
-    currentChainId: chainId,
-    arcTestnetId: ARC_TESTNET_ID,
-  };
+  return { ensureCorrectChain, isOnCorrectChain: chain?.id === ARC_CHAIN_ID };
 }
