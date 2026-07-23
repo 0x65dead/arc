@@ -24,6 +24,11 @@ const RESOLVER_ADDRESS = '0x027d6dCc8F1235dfdd47E532e77909363C701E54';
 const MARKET_ADDRESS = '0xC94Ff1964840BdF8E6952455a2342Ffc6B0bA299';
 const REGISTRY_ADDRESS = '0xCA78696791670CbC14eE802e6DcDfD661a458978';
 const UNIVERSAL_RESOLVER_ADDRESS = '0xA3F364a558eb712AFbB4929df49e538A800438BC';
+// Reverse registrar: maps an address -> a chosen "primary" .arc name, the
+// opposite direction of the registry (which maps a name -> its owner).
+// A user must explicitly claim + set this themselves; registering a name
+// never does this automatically (see triggerSetPrimaryName below).
+const REVERSE_REGISTRAR_ADDRESS = '0x97cdcf037c1A8475eF5C9504A18C10b41f7DfDfB';
 
 // Block from which we start indexing on-chain events (contract deployment block).
 // Only used by the client-side fallback scan below — the indexer keeps its
@@ -45,7 +50,26 @@ const RESOLVER_ABI = parseAbi([
   'function addr(bytes32 node) external view returns (address)',
   'function text(bytes32 node, string calldata key) external view returns (string memory)',
   'function setAddr(bytes32 node, address a) external',
-  'function setText(bytes32 node, string calldata key, string calldata value) external'
+  'function setText(bytes32 node, string calldata key, string calldata value) external',
+  'function setName(bytes32 node, string calldata name) external'
+]);
+
+// Reverse registrar: claim() establishes ownership of this address's reverse
+// node (and points its resolver at RESOLVER_ADDRESS); node(address) returns
+// the canonical reverse node to pass into resolver.setName(). Computing this
+// node by hand (rather than calling node() directly) is what produced the
+// "!auth" revert during manual testing — the contract's own derivation is
+// the only reliable source for it.
+const REVERSE_REGISTRAR_ABI = parseAbi([
+  'function claim() external returns (bytes32)',
+  'function node(address addr) external view returns (bytes32)'
+]);
+
+// Universal Resolver's reverse(): the read side of the primary-name feature.
+// Not indexed anywhere (the indexer only tracks forward registrations), so
+// this is always a live on-chain read, same as available()/price().
+const UNIVERSAL_RESOLVER_ABI = parseAbi([
+  'function reverse(address a) external view returns (string memory name, bool verified)'
 ]);
 
 const REGISTRAR_ABI = parseAbi([
@@ -278,6 +302,14 @@ export default function App() {
   // without needing to plug into a PC for devtools every time.
   const [indexerErrorDetail, setIndexerErrorDetail] = useState<string | null>(null);
 
+  // Primary/reverse name: the human-readable name a user has chosen to
+  // represent their address (the opposite direction of the registry, which
+  // maps a name to its owner). Always a live read — the indexer only tracks
+  // forward registrations, not reverse records.
+  const [primaryName, setPrimaryName] = useState<string | null>(null);
+  const [primaryNamePromptFor, setPrimaryNamePromptFor] = useState<string | null>(null);
+  const [isSettingPrimaryName, setIsSettingPrimaryName] = useState(false);
+
   // Marketplace states
   const [marketplaceListings, setMarketplaceListings] = useState<Array<{
     name: string;
@@ -353,6 +385,88 @@ export default function App() {
     } finally {
       setIsRenewing(null);
     }
+  };
+
+  // --- Primary / reverse name ---
+  // Read side: ask the Universal Resolver whether this address has a
+  // verified reverse record. Always a live on-chain call (the indexer only
+  // tracks forward registrations), but cheap — one view call per address.
+  const fetchPrimaryName = async (userAddress: string) => {
+    try {
+      const provider = new ethers.JsonRpcProvider('https://rpc.testnet.arc.network');
+      const universalResolver = new ethers.Contract(UNIVERSAL_RESOLVER_ADDRESS, UNIVERSAL_RESOLVER_ABI, provider);
+      const [name, verified] = await universalResolver.reverse(userAddress);
+      setPrimaryName(verified && name ? name : null);
+    } catch (err) {
+      // Not fatal — just means we fall back to showing the raw address,
+      // same as if no primary name were set.
+      console.warn('Could not fetch primary name:', err);
+      setPrimaryName(null);
+    }
+  };
+
+  useEffect(() => {
+    if (isConnected && address) {
+      fetchPrimaryName(address);
+    } else {
+      setPrimaryName(null);
+    }
+  }, [isConnected, address]);
+
+  // Write side: claim() establishes reverse-node ownership for this address
+  // and points its resolver at RESOLVER_ADDRESS; node() then returns the
+  // canonical reverse node — computing this by hand (rather than reading it
+  // from the contract) is exactly what produced an "!auth" revert during
+  // manual testing, so we always read it live instead of re-deriving it.
+  const triggerSetPrimaryName = async (name: string) => {
+    if (!address) return;
+    setIsSettingPrimaryName(true);
+    try {
+      await ensureCorrectChain();
+
+      showSuccess('Please approve claiming your reverse record...');
+      const claimTx = await writeContractAsync({
+        address: REVERSE_REGISTRAR_ADDRESS,
+        abi: REVERSE_REGISTRAR_ABI,
+        functionName: 'claim',
+        args: []
+      });
+      await waitForTx(claimTx);
+
+      const provider = new ethers.JsonRpcProvider('https://rpc.testnet.arc.network');
+      const reverseRegistrar = new ethers.Contract(REVERSE_REGISTRAR_ADDRESS, REVERSE_REGISTRAR_ABI, provider);
+      const node = await reverseRegistrar.node(address);
+
+      const fullName = `${name}.arc`;
+      showSuccess(`Please approve setting ${fullName} as your primary name...`);
+      const setNameTx = await writeContractAsync({
+        address: RESOLVER_ADDRESS,
+        abi: RESOLVER_ABI,
+        functionName: 'setName',
+        args: [node as `0x${string}`, fullName]
+      });
+      await waitForTx(setNameTx);
+
+      showSuccess(`${fullName} is now your primary name!`);
+      setPrimaryName(fullName);
+      dismissPrimaryNamePrompt();
+    } catch (err: any) {
+      console.error('Set primary name failed:', err);
+      showError(parseRevertReason(err));
+    } finally {
+      setIsSettingPrimaryName(false);
+    }
+  };
+
+  // Called both when the user dismisses the primary-name prompt and when
+  // triggerSetPrimaryName above finishes successfully — same cleanup either
+  // way, since the commit/search UI needs resetting regardless of the choice.
+  const dismissPrimaryNamePrompt = () => {
+    setPrimaryNamePromptFor(null);
+    setActiveCommitment(null);
+    setSearchResult(null);
+    setSearchQuery('');
+    setActiveTab('my-domains');
   };
 
   // Save tracked domains to local storage
@@ -650,13 +764,12 @@ export default function App() {
       setActiveCommitment(prev => prev ? { ...prev, step: 'completed', txHash: tx } : null);
       addTrackedName(activeCommitment.name);
 
-      // Clear commitment after 5s
-      setTimeout(() => {
-        setActiveCommitment(null);
-        setSearchResult(null);
-        setSearchQuery('');
-        setActiveTab('my-domains');
-      }, 5000);
+      // Registering a name never sets it as the reverse/primary record —
+      // that's a separate, user-authorized action (see triggerSetPrimaryName).
+      // Prompt for it here rather than silently skipping straight to
+      // My Domains, so the two-transaction nature of "look up by name"
+      // vs "display name for my address" is visible instead of assumed.
+      setPrimaryNamePromptFor(activeCommitment.name);
     } catch (err: any) {
       console.error('Registration failed:', err);
       setActiveCommitment(prev => prev ? { ...prev, step: 'ready' } : null);
@@ -1246,20 +1359,19 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-[#070B08] text-[#EAF6EC] font-sans antialiased overflow-x-hidden selection:bg-[#7DFF66] selection:text-[#070B08]">
+    <div className="min-h-screen bg-white text-[#0A0A0A] font-['Inter'] antialiased overflow-x-hidden selection:bg-[#0A0A0A] selection:text-[#0A0A0A]">
       {/* Background radial effects */}
-      <div className="absolute top-0 left-1/4 w-[500px] h-[500px] bg-[#7DFF66]/5 rounded-full blur-[140px] pointer-events-none" />
-      <div className="absolute bottom-20 right-10 w-[400px] h-[400px] bg-[#7DFF66]/3 rounded-full blur-[120px] pointer-events-none" />
+      {/* Background radial effects — intentionally removed for the flat, editorial arc.io-style page */}
 
       {/* --- Sticky Header --- */}
-      <header className="sticky top-0 z-40 bg-[#070B08]/85 backdrop-blur-md border-b border-[#7E9384]/10 transition-all">
+      <header className="sticky top-0 z-40 bg-white/90 backdrop-blur-md border-b border-black/10 transition-all">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-20 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <span className="text-2xl font-black tracking-tight text-[#EAF6EC] select-none">
-              arc<span className="text-[#7DFF66]">.</span>
+            <span className="text-2xl font-black tracking-tight text-[#0A0A0A] select-none">
+              arc<span className="text-[#F2A93B]">.</span>
             </span>
-            <div className="hidden md:flex items-center gap-1.5 px-2.5 py-0.5 rounded-full border border-[#7DFF66]/20 bg-[#7DFF66]/5 text-[11px] font-mono text-[#7DFF66] font-bold">
-              <span className="w-1.5 h-1.5 rounded-full bg-[#7DFF66] animate-pulse" />
+            <div className="hidden md:flex items-center gap-1.5 px-2.5 py-0.5 rounded-full border border-[#F2A93B]/30 bg-[#F2A93B]/10 text-[11px] font-mono text-[#F2A93B] font-bold">
+              <span className="w-1.5 h-1.5 rounded-full bg-[#0A0A0A] animate-pulse" />
               ARC TESTNET ACTIVE
             </div>
           </div>
@@ -1268,15 +1380,15 @@ export default function App() {
             {/* Wallet Button */}
             {isConnected && address ? (
               <div className="flex items-center gap-2">
-                <div className="hidden sm:flex flex-col items-end font-mono text-[11px] text-[#7E9384]">
+                <div className="hidden sm:flex flex-col items-end font-mono text-[11px] text-[#6B6B6B]">
                   <span>USDC Gas Token</span>
                 </div>
-                <div className="flex items-center gap-2 bg-[#7DFF66]/10 border border-[#7DFF66]/30 px-3 py-1.5 rounded-lg">
-                  <span className="w-2 h-2 rounded-full bg-[#7DFF66]" />
-                  <span className="text-xs font-mono font-bold text-[#EAF6EC]">
-                    {address.slice(0, 6)}...{address.slice(-4)}
+                <div className="flex items-center gap-2 bg-[#F2A93B]/10 border border-[#F2A93B]/40 px-3 py-1.5 rounded-lg">
+                  <span className="w-2 h-2 rounded-full bg-[#0A0A0A]" />
+                  <span className="text-xs font-mono font-bold text-[#0A0A0A]">
+                    {primaryName ?? `${address.slice(0, 6)}...${address.slice(-4)}`}
                   </span>
-                  <button onClick={() => disconnect()} className="text-[#7E9384] hover:text-red-400 text-xs ml-1 font-semibold uppercase">
+                  <button onClick={() => disconnect()} className="text-[#6B6B6B] hover:text-red-400 text-xs ml-1 font-semibold uppercase">
                     Exit
                   </button>
                 </div>
@@ -1284,7 +1396,7 @@ export default function App() {
             ) : (
               <button
                 onClick={() => connect({ connector: injected() })}
-                className="relative group overflow-hidden border border-[#7DFF66] text-[#7DFF66] font-mono font-bold text-xs uppercase px-5 py-2.5 rounded-md transition-all duration-300 hover:bg-[#7DFF66] hover:text-[#070B08] shadow-[0_0_15px_rgba(125,255,102,0.15)]"
+                className="relative group overflow-hidden border border-[#0A0A0A] text-[#0A0A0A] font-mono font-bold text-xs uppercase px-5 py-2.5 rounded-md transition-all duration-300 hover:bg-[#0A0A0A] hover:text-white shadow-sm"
               >
                 Connect Wallet
               </button>
@@ -1293,7 +1405,7 @@ export default function App() {
             {/* Hamburger */}
             <button
               onClick={() => setIsMenuOpen(true)}
-              className="p-2 text-[#7E9384] hover:text-[#EAF6EC] transition-colors"
+              className="p-2 text-[#6B6B6B] hover:text-[#0A0A0A] transition-colors"
             >
               <Menu className="w-6 h-6" />
             </button>
@@ -1325,13 +1437,13 @@ export default function App() {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 bg-[#070B08]/95 backdrop-blur-lg flex flex-col justify-between p-8"
+            className="fixed inset-0 z-50 bg-white/95 backdrop-blur-lg flex flex-col justify-between p-8"
           >
             <div className="flex justify-between items-center">
-              <span className="text-3xl font-black text-white">
-                arc<span className="text-[#7DFF66]">.</span>
+              <span className="text-3xl font-black text-[#0A0A0A]">
+                arc<span className="text-[#F2A93B]">.</span>
               </span>
-              <button onClick={() => setIsMenuOpen(false)} className="p-3 bg-white/5 rounded-full text-[#7E9384] hover:text-white transition-all">
+              <button onClick={() => setIsMenuOpen(false)} className="p-3 bg-black/[0.03] rounded-full text-[#6B6B6B] hover:text-[#0A0A0A] transition-all">
                 <X className="w-6 h-6" />
               </button>
             </div>
@@ -1350,18 +1462,18 @@ export default function App() {
                     setActiveTab(item.id as any);
                     setIsMenuOpen(false);
                   }}
-                  className={`text-left transition-colors ${activeTab === item.id ? 'text-[#7DFF66]' : 'text-[#7E9384] hover:text-white'}`}
+                  className={`text-left transition-colors ${activeTab === item.id ? 'text-[#F2A93B]' : 'text-[#6B6B6B] hover:text-[#0A0A0A]'}`}
                 >
                   {item.label}
                 </button>
               ))}
             </nav>
 
-            <div className="border-t border-[#7E9384]/10 pt-6">
-              <p className="text-xs text-[#7E9384] font-mono uppercase tracking-widest mb-2">ARC Blockchain Info</p>
-              <div className="flex flex-col sm:flex-row sm:justify-between text-sm text-[#EAF6EC] font-mono">
+            <div className="border-t border-black/10 pt-6">
+              <p className="text-xs text-[#6B6B6B] font-mono uppercase tracking-widest mb-2">ARC Blockchain Info</p>
+              <div className="flex flex-col sm:flex-row sm:justify-between text-sm text-[#0A0A0A] font-mono">
                 <span>Chain ID: 5042002</span>
-                <span className="text-[#7DFF66]">Gas Asset: Native USDC</span>
+                <span className="text-[#F2A93B]">Gas Asset: Native USDC</span>
               </div>
             </div>
           </motion.div>
@@ -1381,9 +1493,9 @@ export default function App() {
                 animate={{ opacity: 1, y: 0 }}
                 className="text-4xl sm:text-6xl font-black tracking-tight"
               >
-                Your wallet, under a <span className="text-transparent bg-clip-text bg-gradient-to-r from-[#7DFF66] to-[#EAF6EC] drop-shadow-[0_0_30px_rgba(125,255,102,0.2)]">name you own</span>.
+                Your wallet, under a <span className="text-transparent bg-clip-text bg-gradient-to-r from-[#FF8A65] via-[#F2555A] to-[#C23BA0]">name you own</span>.
               </motion.h1>
-              <p className="text-[#7E9384] text-lg sm:text-xl">
+              <p className="text-[#6B6B6B] text-lg sm:text-xl">
                 The institutional standard for identity on the Arc Blockchain. Native USDC gas payments, sub-second finality.
               </p>
             </div>
@@ -1396,22 +1508,22 @@ export default function App() {
                   placeholder="Search your .arc name"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full bg-[#070B08]/60 border-2 border-[#7E9384]/20 focus:border-[#7DFF66] rounded-xl py-5 pl-6 pr-24 text-lg font-mono tracking-wide text-white outline-none transition-all focus:shadow-[0_0_30px_rgba(125,255,102,0.12)] group-hover:border-[#7E9384]/40"
+                  className="w-full bg-[#FAFAFA] border-2 border-black/10 focus:border-[#0A0A0A] rounded-xl py-5 pl-6 pr-24 text-lg font-mono tracking-wide text-[#0A0A0A] outline-none transition-all focus:shadow-sm group-hover:border-black/25"
                 />
-                <div className="absolute right-20 font-mono font-bold text-[#7E9384] text-lg select-none pointer-events-none mr-2">
+                <div className="absolute right-20 font-mono font-bold text-[#6B6B6B] text-lg select-none pointer-events-none mr-2">
                   .arc
                 </div>
                 <button
                   type="submit"
                   disabled={isSearching}
-                  className="absolute right-3 p-3.5 bg-[#7DFF66] hover:bg-[#8aff75] text-[#070B08] rounded-lg transition-all"
+                  className="absolute right-3 p-3.5 bg-[#0A0A0A] hover:bg-[#1a1a1a] text-white rounded-lg transition-all"
                 >
                   {isSearching ? <RefreshCw className="w-5 h-5 animate-spin" /> : <Search className="w-5 h-5" />}
                 </button>
               </form>
 
               {/* Quick-tag pills */}
-              <div className="flex flex-wrap gap-2.5 justify-center mt-4 text-xs font-mono text-[#7E9384]">
+              <div className="flex flex-wrap gap-2.5 justify-center mt-4 text-xs font-mono text-[#6B6B6B]">
                 <span>Try searching:</span>
                 {['btc', 'sol', 'usdc', 'degen', 'prime'].map((tag) => (
                   <button
@@ -1422,7 +1534,7 @@ export default function App() {
                         setSearchResult(null);
                       }, 50);
                     }}
-                    className="px-2 py-0.5 bg-[#7E9384]/10 rounded hover:bg-[#7DFF66]/10 hover:text-[#7DFF66] transition-all"
+                    className="px-2 py-0.5 bg-black/5 rounded hover:bg-[#F2A93B]/10 hover:text-[#F2A93B] transition-all"
                   >
                     [{tag}]
                   </button>
@@ -1435,7 +1547,7 @@ export default function App() {
               <motion.div
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
-                className="max-w-2xl mx-auto bg-[#070B08]/40 border border-[#7E9384]/10 rounded-2xl p-6 backdrop-blur-sm space-y-6"
+                className="max-w-2xl mx-auto bg-[#FAFAFA] border border-black/10 rounded-2xl p-6 backdrop-blur-sm space-y-6"
               >
                 {!searchResult.isValid ? (
                   <div className="flex items-center gap-3 text-amber-400 font-mono text-sm bg-amber-400/5 border border-amber-400/20 p-4 rounded-xl">
@@ -1446,38 +1558,38 @@ export default function App() {
                   <div className="space-y-6">
                     <div className="flex justify-between items-start">
                       <div>
-                        <h3 className="text-2xl font-bold font-mono text-white">
-                          {searchResult.name}<span className="text-[#7DFF66]">.arc</span>
+                        <h3 className="text-2xl font-bold font-mono text-[#0A0A0A]">
+                          {searchResult.name}<span className="text-[#F2A93B]">.arc</span>
                         </h3>
-                        <span className="text-xs font-mono text-[#7DFF66] font-bold uppercase tracking-wider">Available for claim</span>
+                        <span className="text-xs font-mono text-[#F2A93B] font-bold uppercase tracking-wider">Available for claim</span>
                       </div>
                       <div className="text-right">
-                        <span className="text-[#7DFF66] text-3xl font-black font-mono">
+                        <span className="text-[#F2A93B] text-3xl font-black font-mono">
                           {searchResult.priceFormatted}
                         </span>
-                        <span className="text-[#7E9384] text-xs block font-mono">USDC / Year</span>
+                        <span className="text-[#6B6B6B] text-xs block font-mono">USDC / Year</span>
                       </div>
                     </div>
 
-                    <div className="border-t border-[#7E9384]/15 pt-6 space-y-4">
-                      <h4 className="text-sm font-mono text-[#7E9384] uppercase tracking-wider font-bold">Claim Commit-Reveal Flow</h4>
+                    <div className="border-t border-black/10 pt-6 space-y-4">
+                      <h4 className="text-sm font-mono text-[#6B6B6B] uppercase tracking-wider font-bold">Claim Commit-Reveal Flow</h4>
 
                       {/* Step Status Tracker */}
                       <div className="grid grid-cols-3 gap-2 text-center text-xs font-mono">
                         <div className={`p-3 rounded-lg border transition-all ${
-                          !activeCommitment ? 'bg-[#7DFF66]/5 border-[#7DFF66]/30 text-[#7DFF66]' : 'bg-[#7E9384]/5 border-[#7E9384]/10 text-[#7E9384]'
+                          !activeCommitment ? 'bg-[#F2A93B]/10 border-[#F2A93B]/40 text-[#F2A93B]' : 'bg-black/[0.03] border-black/10 text-[#6B6B6B]'
                         }`}>
                           <div className="font-black text-base mb-1">01</div>
                           <span>Commit Name</span>
                         </div>
                         <div className={`p-3 rounded-lg border transition-all ${
-                          activeCommitment && activeCommitment.step === 'waiting' ? 'bg-[#7DFF66]/5 border-[#7DFF66]/30 text-[#7DFF66]' : 'bg-[#7E9384]/5 border-[#7E9384]/10 text-[#7E9384]'
+                          activeCommitment && activeCommitment.step === 'waiting' ? 'bg-[#F2A93B]/10 border-[#F2A93B]/40 text-[#F2A93B]' : 'bg-black/[0.03] border-black/10 text-[#6B6B6B]'
                         }`}>
                           <div className="font-black text-base mb-1">02</div>
                           <span>Wait {countdown > 0 ? `(${countdown}s)` : 'Timer'}</span>
                         </div>
                         <div className={`p-3 rounded-lg border transition-all ${
-                          activeCommitment && (activeCommitment.step === 'ready' || activeCommitment.step === 'registering') ? 'bg-[#7DFF66]/5 border-[#7DFF66]/30 text-[#7DFF66]' : 'bg-[#7E9384]/5 border-[#7E9384]/10 text-[#7E9384]'
+                          activeCommitment && (activeCommitment.step === 'ready' || activeCommitment.step === 'registering') ? 'bg-[#F2A93B]/10 border-[#F2A93B]/40 text-[#F2A93B]' : 'bg-black/[0.03] border-black/10 text-[#6B6B6B]'
                         }`}>
                           <div className="font-black text-base mb-1">03</div>
                           <span>Reveal & Mint</span>
@@ -1488,41 +1600,70 @@ export default function App() {
                       {!activeCommitment ? (
                         <button
                           onClick={triggerCommit}
-                          className="w-full bg-[#7DFF66] hover:bg-[#8aff75] text-[#070B08] font-bold font-mono py-4 rounded-xl transition-all shadow-[0_4px_20px_rgba(125,255,102,0.15)] flex items-center justify-center gap-2 text-sm uppercase"
+                          className="w-full bg-[#0A0A0A] hover:bg-[#1a1a1a] text-white font-bold font-mono py-4 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2 text-sm uppercase"
                         >
                           <Clock className="w-5 h-5" />
                           Step 1: Commit Registry Reservation
                         </button>
                       ) : activeCommitment.step === 'waiting' ? (
                         <div className="space-y-4">
-                          <div className="relative w-full bg-[#7E9384]/10 h-3 rounded-full overflow-hidden">
+                          <div className="relative w-full bg-black/5 h-3 rounded-full overflow-hidden">
                             <motion.div
                               initial={{ width: '0%' }}
                               animate={{ width: `${((60 - countdown) / 60) * 100}%` }}
-                              className="absolute top-0 bottom-0 left-0 bg-[#7DFF66]"
+                              className="absolute top-0 bottom-0 left-0 bg-[#0A0A0A]"
                             />
                           </div>
-                          <p className="text-xs text-[#7E9384] text-center font-mono animate-pulse">
+                          <p className="text-xs text-[#6B6B6B] text-center font-mono animate-pulse">
                             Preventing front-running on-chain. Please wait 60 seconds...
                           </p>
                         </div>
                       ) : activeCommitment.step === 'ready' ? (
                         <button
                           onClick={triggerRegister}
-                          className="w-full bg-[#7DFF66] hover:bg-[#8aff75] text-[#070B08] font-bold font-mono py-4 rounded-xl transition-all shadow-[0_4px_20px_rgba(125,255,102,0.15)] flex items-center justify-center gap-2 text-sm uppercase"
+                          className="w-full bg-[#0A0A0A] hover:bg-[#1a1a1a] text-white font-bold font-mono py-4 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2 text-sm uppercase"
                         >
                           <Sparkles className="w-5 h-5" />
                           Step 3: Reveal and Claim Domain
                         </button>
                       ) : activeCommitment.step === 'registering' ? (
-                        <div className="flex items-center justify-center gap-3 p-4 bg-[#7DFF66]/10 border border-[#7DFF66]/20 rounded-xl text-center">
-                          <RefreshCw className="w-5 h-5 animate-spin text-[#7DFF66]" />
-                          <span className="font-mono text-sm text-[#7DFF66]">Processing registration on-chain...</span>
+                        <div className="flex items-center justify-center gap-3 p-4 bg-[#F2A93B]/10 border border-[#F2A93B]/30 rounded-xl text-center">
+                          <RefreshCw className="w-5 h-5 animate-spin text-[#F2A93B]" />
+                          <span className="font-mono text-sm text-[#F2A93B]">Processing registration on-chain...</span>
                         </div>
                       ) : (
-                        <div className="p-4 bg-emerald-500/10 border border-emerald-500/20 text-[#7DFF66] text-center rounded-xl font-mono text-sm flex items-center justify-center gap-2">
-                          <CheckCircle2 className="w-5 h-5" />
-                          <span>Successfully Claimed Domain! Redirecting...</span>
+                        <div className="space-y-3">
+                          <div className="p-4 bg-emerald-500/10 border border-emerald-500/20 text-emerald-600 text-center rounded-xl font-mono text-sm flex items-center justify-center gap-2">
+                            <CheckCircle2 className="w-5 h-5" />
+                            <span>Successfully Claimed Domain!</span>
+                          </div>
+
+                          {primaryNamePromptFor && (
+                            <div className="p-4 bg-[#FAFAFA] border border-black/10 rounded-xl space-y-3">
+                              <p className="text-sm text-[#0A0A0A]">
+                                Set <span className="font-mono font-bold">{primaryNamePromptFor}.arc</span> as your primary name?
+                                <span className="block text-xs text-[#6B6B6B] font-mono mt-1">
+                                  This is what wallets and this app will display for your address — a separate transaction from registering the name itself.
+                                </span>
+                              </p>
+                              <div className="flex gap-3">
+                                <button
+                                  onClick={dismissPrimaryNamePrompt}
+                                  className="flex-1 border border-black/10 hover:bg-black/[0.03] text-[#0A0A0A] font-mono text-xs py-2.5 rounded-lg uppercase"
+                                >
+                                  Skip
+                                </button>
+                                <button
+                                  onClick={() => triggerSetPrimaryName(primaryNamePromptFor)}
+                                  disabled={isSettingPrimaryName}
+                                  className="flex-1 bg-[#0A0A0A] hover:bg-[#1a1a1a] text-white font-bold font-mono text-xs py-2.5 rounded-lg uppercase flex items-center justify-center gap-1.5"
+                                >
+                                  {isSettingPrimaryName ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : null}
+                                  Set as Primary
+                                </button>
+                              </div>
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
@@ -1530,25 +1671,25 @@ export default function App() {
                 ) : (
                   <div className="space-y-6">
                     {address && searchResult.owner && searchResult.owner.toLowerCase() === address.toLowerCase() ? (
-                      <div className="flex justify-between items-center bg-[#7DFF66]/5 border border-[#7DFF66]/20 p-4 rounded-xl">
+                      <div className="flex justify-between items-center bg-[#F2A93B]/10 border border-[#F2A93B]/30 p-4 rounded-xl">
                         <div className="flex items-center gap-3">
-                          <CheckCircle2 className="w-5 h-5 text-[#7DFF66] shrink-0" />
+                          <CheckCircle2 className="w-5 h-5 text-[#F2A93B] shrink-0" />
                           <div>
-                            <span className="font-mono font-bold block text-white">{searchResult.name}.arc</span>
-                            <span className="text-xs text-[#7DFF66] font-mono font-bold">You own this domain!</span>
+                            <span className="font-mono font-bold block text-[#0A0A0A]">{searchResult.name}.arc</span>
+                            <span className="text-xs text-[#F2A93B] font-mono font-bold">You own this domain!</span>
                           </div>
                         </div>
                         <div className="flex gap-2">
                           <button
                             onClick={() => openRecordManager(searchResult.name)}
-                            className="bg-white/5 hover:bg-white/10 text-white font-mono text-xs px-3 py-1.5 rounded-lg border border-white/10 font-bold uppercase transition-all"
+                            className="bg-black/[0.03] hover:bg-black/5 text-[#0A0A0A] font-mono text-xs px-3 py-1.5 rounded-lg border border-black/10 font-bold uppercase transition-all"
                           >
                             MANAGE
                           </button>
                           <button
                             onClick={() => triggerRenew(searchResult.name)}
                             disabled={isRenewing === searchResult.name}
-                            className="bg-[#7DFF66]/10 hover:bg-[#7DFF66]/20 text-[#7DFF66] border border-[#7DFF66]/30 font-mono text-xs px-3 py-1.5 rounded-lg font-bold uppercase transition-all flex items-center gap-1"
+                            className="bg-[#F2A93B]/10 hover:bg-[#F2A93B]/15 text-[#F2A93B] border border-[#F2A93B]/40 font-mono text-xs px-3 py-1.5 rounded-lg font-bold uppercase transition-all flex items-center gap-1"
                           >
                             {isRenewing === searchResult.name ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : null}
                             RENEW
@@ -1560,8 +1701,8 @@ export default function App() {
                         <div className="flex items-center gap-3">
                           <AlertCircle className="w-5 h-5 text-red-400 shrink-0" />
                           <div>
-                            <span className="font-mono font-bold block text-white">{searchResult.name}.arc</span>
-                            <span className="text-xs text-[#7E9384]">Already registered by someone else</span>
+                            <span className="font-mono font-bold block text-[#0A0A0A]">{searchResult.name}.arc</span>
+                            <span className="text-xs text-[#6B6B6B]">Already registered by someone else</span>
                           </div>
                         </div>
                         <button
@@ -1570,7 +1711,7 @@ export default function App() {
                             setSearchQuery('');
                             setSearchResult(null);
                           }}
-                          className="bg-white/5 hover:bg-white/10 text-white font-mono text-xs px-3 py-1.5 rounded-lg border border-white/10"
+                          className="bg-black/[0.03] hover:bg-black/5 text-[#0A0A0A] font-mono text-xs px-3 py-1.5 rounded-lg border border-black/10"
                         >
                           Check Market
                         </button>
@@ -1578,15 +1719,15 @@ export default function App() {
                     )}
 
                     {searchResult.owner && (
-                      <div className="bg-[#7E9384]/5 rounded-xl p-4 font-mono text-xs text-[#7E9384] space-y-2">
+                      <div className="bg-black/[0.03] rounded-xl p-4 font-mono text-xs text-[#6B6B6B] space-y-2">
                         <div className="flex justify-between">
                           <span>Owner Address:</span>
-                          <span className="text-white text-right break-all text-[11px]">{searchResult.owner}</span>
+                          <span className="text-[#0A0A0A] text-right break-all text-[11px]">{searchResult.owner}</span>
                         </div>
                         {searchResult.resolver && searchResult.resolver !== ethers.ZeroAddress && (
                           <div className="flex justify-between">
                             <span>Resolver Address:</span>
-                            <span className="text-white text-right break-all text-[11px]">{searchResult.resolver}</span>
+                            <span className="text-[#0A0A0A] text-right break-all text-[11px]">{searchResult.resolver}</span>
                           </div>
                         )}
                       </div>
@@ -1597,23 +1738,21 @@ export default function App() {
             )}
 
             {/* --- Stats Dashboard --- */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 pt-6">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-black/10 border-t border-black/10 pt-6 mt-6">
               {[
                 { title: 'TOTAL REVENUE', value: `$${statsRevenue}`, desc: `${statsNamesCount} registered names`, change: 'Live Event-Indexed' },
                 { title: 'NAMES CLAIMED', value: statsNamesCount, desc: 'Active unique users', change: 'Stablecoin native' },
                 { title: 'SETTLES IN', value: '< 350ms', desc: 'Malachite finality', change: 'Deterministic' },
                 { title: 'GAS FEES', value: '< $0.01', desc: 'Denominated in USDC', change: 'Zero volatile exposure' }
               ].map((card, i) => (
-                <div
-                  key={i}
-                  className="bg-[#070B08]/40 border border-[#7E9384]/15 rounded-xl p-6 backdrop-blur-sm space-y-2 relative overflow-hidden group hover:border-[#7DFF66]/30 transition-all"
-                >
-                  <div className="absolute top-0 right-0 w-24 h-24 bg-[#7DFF66]/2 rounded-full blur-xl pointer-events-none group-hover:bg-[#7DFF66]/5 transition-all" />
-                  <span className="text-[11px] font-mono text-[#7E9384] font-bold tracking-widest block uppercase">{card.title}</span>
-                  <div className="text-3xl font-black tracking-tight text-white font-mono">{card.value}</div>
+                <div key={i} className="py-6 sm:py-0 sm:px-6 first:sm:pl-0 space-y-2">
+                  <span className="text-[11px] font-mono text-[#6B6B6B] font-bold tracking-widest block uppercase">
+                    {'{'}{card.title}{'}'}
+                  </span>
+                  <div className="text-3xl font-black tracking-tight text-[#0A0A0A]">{card.value}</div>
                   <div className="flex items-center justify-between text-xs font-mono pt-1">
-                    <span className="text-[#7E9384]">{card.desc}</span>
-                    <span className="text-[#7DFF66] font-bold">{card.change}</span>
+                    <span className="text-[#6B6B6B]">{card.desc}</span>
+                    <span className="text-[#F2A93B] font-bold">{card.change}</span>
                   </div>
                 </div>
               ))}
@@ -1626,12 +1765,12 @@ export default function App() {
           <section className="space-y-8">
             <div className="flex justify-between items-end">
               <div>
-                <h2 className="text-3xl font-black tracking-tight">Your On-Chain <span className="text-[#7DFF66]">Identity</span></h2>
-                <p className="text-[#7E9384] text-sm font-mono mt-1">DECIMALS FORMAT: 18-DECIMAL NATIVE USDC</p>
+                <h2 className="text-3xl font-black tracking-tight">Your On-Chain <span className="text-[#F2A93B]">Identity</span></h2>
+                <p className="text-[#6B6B6B] text-sm font-mono mt-1">DECIMALS FORMAT: 18-DECIMAL NATIVE USDC</p>
               </div>
               <button
                 onClick={fetchDomainsAndListings}
-                className="flex items-center gap-2 text-xs font-mono text-[#7E9384] hover:text-[#7DFF66] bg-white/5 border border-white/5 hover:border-[#7DFF66]/30 px-3 py-1.5 rounded-lg transition-all"
+                className="flex items-center gap-2 text-xs font-mono text-[#6B6B6B] hover:text-[#F2A93B] bg-black/[0.03] border border-black/5 hover:border-[#F2A93B]/40 px-3 py-1.5 rounded-lg transition-all"
               >
                 <RefreshCw className="w-4 h-4" />
                 Refresh Wallet
@@ -1639,34 +1778,34 @@ export default function App() {
             </div>
 
             {!isConnected ? (
-              <div className="text-center p-12 bg-white/5 border border-white/5 rounded-2xl max-w-xl mx-auto space-y-4">
-                <Wallet className="w-12 h-12 text-[#7E9384] mx-auto animate-bounce" />
+              <div className="text-center p-12 bg-black/[0.03] border border-black/5 rounded-2xl max-w-xl mx-auto space-y-4">
+                <Wallet className="w-12 h-12 text-[#6B6B6B] mx-auto animate-bounce" />
                 <h3 className="text-lg font-bold">Connect your Web3 wallet</h3>
-                <p className="text-sm text-[#7E9384] font-mono">
+                <p className="text-sm text-[#6B6B6B] font-mono">
                   Wallet is required to fetch registered domains and edit ENS primary records.
                 </p>
                 <button
                   onClick={() => connect({ connector: injected() })}
-                  className="bg-[#7DFF66] text-[#070B08] font-bold font-mono text-xs px-6 py-3 rounded-lg uppercase"
+                  className="bg-[#0A0A0A] text-white font-bold font-mono text-xs px-6 py-3 rounded-lg uppercase"
                 >
                   Connect Wallet
                 </button>
               </div>
             ) : isLoadingDomains ? (
               <div className="text-center py-20">
-                <RefreshCw className="w-8 h-8 animate-spin text-[#7DFF66] mx-auto mb-4" />
-                <span className="font-mono text-[#7E9384]">Scanning registry for ownership data...</span>
+                <RefreshCw className="w-8 h-8 animate-spin text-[#F2A93B] mx-auto mb-4" />
+                <span className="font-mono text-[#6B6B6B]">Scanning registry for ownership data...</span>
               </div>
             ) : userDomains.length === 0 ? (
-              <div className="text-center p-16 bg-[#070B08]/40 border border-[#7E9384]/10 rounded-2xl max-w-xl mx-auto space-y-4">
-                <Globe className="w-12 h-12 text-[#7E9384] mx-auto" />
+              <div className="text-center p-16 bg-[#FAFAFA] border border-black/10 rounded-2xl max-w-xl mx-auto space-y-4">
+                <Globe className="w-12 h-12 text-[#6B6B6B] mx-auto" />
                 <h3 className="text-lg font-bold">No domains owned yet</h3>
-                <p className="text-sm text-[#7E9384] font-mono">
+                <p className="text-sm text-[#6B6B6B] font-mono">
                   Any name you register on Arc Testnet will show up here instantly.
                 </p>
                 <button
                   onClick={() => setActiveTab('search')}
-                  className="bg-[#7DFF66] hover:bg-[#8aff75] text-[#070B08] font-bold font-mono text-xs px-6 py-3 rounded-lg uppercase"
+                  className="bg-[#0A0A0A] hover:bg-[#1a1a1a] text-white font-bold font-mono text-xs px-6 py-3 rounded-lg uppercase"
                 >
                   Register one now
                 </button>
@@ -1676,9 +1815,9 @@ export default function App() {
                 {userDomains.map((dom) => (
                   <div
                     key={dom.id}
-                    className="bg-[#070B08] border border-[#7E9384]/15 rounded-2xl overflow-hidden group hover:border-[#7DFF66]/30 transition-all flex flex-col justify-between"
+                    className="bg-white border border-black/10 rounded-2xl overflow-hidden group hover:border-[#F2A93B]/40 transition-all flex flex-col justify-between"
                   >
-                    <div className="aspect-square bg-slate-950 flex items-center justify-center p-4 relative overflow-hidden">
+                    <div className="aspect-square bg-[#FAFAFA] flex items-center justify-center p-4 relative overflow-hidden">
                       <img
                         src={dom.svgUrl}
                         alt={dom.name}
@@ -1686,37 +1825,37 @@ export default function App() {
                       />
                     </div>
 
-                    <div className="p-6 space-y-4 bg-white/2">
+                    <div className="p-6 space-y-4 bg-black/[0.02]">
                       <div className="flex justify-between items-start">
                         <div>
-                          <h3 className="text-xl font-bold font-mono text-white">{dom.name}.arc</h3>
-                          <span className="text-[10px] font-mono text-[#7E9384] block">TOKEN ID: {dom.id.slice(0, 10)}...</span>
+                          <h3 className="text-xl font-bold font-mono text-[#0A0A0A]">{dom.name}.arc</h3>
+                          <span className="text-[10px] font-mono text-[#6B6B6B] block">TOKEN ID: {dom.id.slice(0, 10)}...</span>
                           {dom.resolvedAddress && dom.resolvedAddress !== ethers.ZeroAddress && (
-                            <span className="text-[10px] font-mono text-[#7DFF66] block mt-1 truncate max-w-[200px]" title={dom.resolvedAddress}>
+                            <span className="text-[10px] font-mono text-[#F2A93B] block mt-1 truncate max-w-[200px]" title={dom.resolvedAddress}>
                               RESOLVES TO: {dom.resolvedAddress.slice(0, 6)}...{dom.resolvedAddress.slice(-4)}
                             </span>
                           )}
                         </div>
                         <button
                           onClick={() => handleCopy(`${dom.name}.arc`, dom.name)}
-                          className="p-2 bg-white/5 rounded-lg text-[#7E9384] hover:text-white"
+                          className="p-2 bg-black/[0.03] rounded-lg text-[#6B6B6B] hover:text-[#0A0A0A]"
                         >
-                          {copiedName === dom.name ? <Check className="w-4 h-4 text-[#7DFF66]" /> : <Copy className="w-4 h-4" />}
+                          {copiedName === dom.name ? <Check className="w-4 h-4 text-[#F2A93B]" /> : <Copy className="w-4 h-4" />}
                         </button>
                       </div>
 
                       <div className="flex gap-2">
                         <button
                           onClick={() => openRecordManager(dom.name)}
-                          className="flex-1 bg-white/5 hover:bg-white/10 text-white font-mono text-xs py-2.5 rounded-lg border border-white/10 flex items-center justify-center gap-1.5 transition-all"
+                          className="flex-1 bg-black/[0.03] hover:bg-black/5 text-[#0A0A0A] font-mono text-xs py-2.5 rounded-lg border border-black/10 flex items-center justify-center gap-1.5 transition-all"
                         >
-                          <Settings className="w-4 h-4 text-[#7DFF66]" />
+                          <Settings className="w-4 h-4 text-[#F2A93B]" />
                           Edit Records
                         </button>
 
                         <button
                           onClick={() => initiateListing(dom.name)}
-                          className="flex-1 bg-[#7DFF66]/10 hover:bg-[#7DFF66]/20 text-[#7DFF66] border border-[#7DFF66]/30 font-mono text-xs py-2.5 rounded-lg flex items-center justify-center gap-1.5 transition-all"
+                          className="flex-1 bg-[#F2A93B]/10 hover:bg-[#F2A93B]/15 text-[#F2A93B] border border-[#F2A93B]/40 font-mono text-xs py-2.5 rounded-lg flex items-center justify-center gap-1.5 transition-all"
                         >
                           <ShoppingBag className="w-4 h-4" />
                           List Market
@@ -1734,14 +1873,14 @@ export default function App() {
         {activeTab === 'marketplace' && (
           <section className="space-y-8">
             <div>
-              <h2 className="text-3xl font-black tracking-tight">Active Secondary <span className="text-[#7DFF66]">Listings</span></h2>
-              <p className="text-[#7E9384] text-sm font-mono mt-1">TRADE STABLECOIN DECENTRALIZED IDENTITY SECURELY</p>
+              <h2 className="text-3xl font-black tracking-tight">Active Secondary <span className="text-[#F2A93B]">Listings</span></h2>
+              <p className="text-[#6B6B6B] text-sm font-mono mt-1">TRADE STABLECOIN DECENTRALIZED IDENTITY SECURELY</p>
             </div>
 
-            <div className="bg-[#070B08]/40 border border-[#7E9384]/15 rounded-2xl overflow-hidden backdrop-blur-sm">
+            <div className="bg-[#FAFAFA] border border-black/10 rounded-2xl overflow-hidden backdrop-blur-sm">
               <div className="overflow-x-auto">
                 <table className="w-full text-left font-mono text-sm">
-                  <thead className="bg-white/2 border-b border-[#7E9384]/10 text-xs text-[#7E9384] tracking-wider font-bold">
+                  <thead className="bg-black/[0.02] border-b border-black/10 text-xs text-[#6B6B6B] tracking-wider font-bold">
                     <tr>
                       <th className="p-5">Name</th>
                       <th className="p-5">Price (USDC)</th>
@@ -1749,24 +1888,24 @@ export default function App() {
                       <th className="p-5 text-right">Action</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-[#7E9384]/10">
+                  <tbody className="divide-y divide-black/10">
                     {marketplaceListings.length === 0 ? (
                       <tr>
-                        <td colSpan={4} className="p-12 text-center text-[#7E9384]">
-                          <ShoppingBag className="w-8 h-8 text-[#7E9384]/40 mx-auto mb-3" />
+                        <td colSpan={4} className="p-12 text-center text-[#6B6B6B]">
+                          <ShoppingBag className="w-8 h-8 text-[#6B6B6B]/40 mx-auto mb-3" />
                           <span>No secondary listings currently found on-chain.</span>
                         </td>
                       </tr>
                     ) : (
                       marketplaceListings.map((listing) => (
-                        <tr key={listing.id} className="hover:bg-white/2 transition-colors">
-                          <td className="p-5 font-bold text-white text-base">
+                        <tr key={listing.id} className="hover:bg-black/[0.02] transition-colors">
+                          <td className="p-5 font-bold text-[#0A0A0A] text-base">
                             {listing.name}.arc
                           </td>
-                          <td className="p-5 text-[#7DFF66] font-black text-lg">
+                          <td className="p-5 text-[#F2A93B] font-black text-lg">
                             {listing.price} USDC
                           </td>
-                          <td className="p-5 text-[#7E9384] text-xs">
+                          <td className="p-5 text-[#6B6B6B] text-xs">
                             {listing.seller.slice(0, 8)}...{listing.seller.slice(-8)}
                           </td>
                           <td className="p-5 text-right">
@@ -1780,7 +1919,7 @@ export default function App() {
                             ) : (
                               <button
                                 onClick={() => purchaseListing(listing)}
-                                className="bg-[#7DFF66] hover:bg-[#8aff75] text-[#070B08] px-5 py-2 rounded-lg text-xs font-black uppercase transition-all"
+                                className="bg-[#0A0A0A] hover:bg-[#1a1a1a] text-white px-5 py-2 rounded-lg text-xs font-black uppercase transition-all"
                               >
                                 Buy Domain
                               </button>
@@ -1800,39 +1939,39 @@ export default function App() {
         {activeTab === 'explorer' && (
           <section className="space-y-12">
             <div className="text-center max-w-2xl mx-auto space-y-2">
-              <h2 className="text-4xl font-black tracking-tight">Simple. Transparent. <span className="text-[#7DFF66]">Pricing</span>.</h2>
-              <p className="text-[#7E9384] text-sm font-mono">ANNUAL REGISTRATION FEE SCALE DENOMINATED IN USD, PAID IN NATIVE USDC</p>
+              <h2 className="text-4xl font-black tracking-tight">Simple. Transparent. <span className="text-[#F2A93B]">Pricing</span>.</h2>
+              <p className="text-[#6B6B6B] text-sm font-mono">ANNUAL REGISTRATION FEE SCALE DENOMINATED IN USD, PAID IN NATIVE USDC</p>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
               {[
-                { char: '3 Characters', price: '$640', sub: 'Highly institutional & high-prestige labels', gradient: 'from-[#7DFF66]/10 to-[#7DFF66]/0', border: 'border-[#7DFF66]/20' },
-                { char: '4 Characters', price: '$160', sub: 'Standard business & startup identifiers', gradient: 'from-white/5 to-white/0', border: 'border-white/10' },
-                { char: '5+ Characters', price: '$5', sub: 'Standard personal identity & developer profiles', gradient: 'from-white/5 to-white/0', border: 'border-white/10' }
+                { char: '3 Characters', price: '$640', sub: 'Highly institutional & high-prestige labels', gradient: 'from-[#F2A93B]/10 to-[#F2A93B]/0', border: 'border-[#F2A93B]/30' },
+                { char: '4 Characters', price: '$160', sub: 'Standard business & startup identifiers', gradient: 'from-black/[0.02] to-black/0', border: 'border-black/10' },
+                { char: '5+ Characters', price: '$5', sub: 'Standard personal identity & developer profiles', gradient: 'from-black/[0.02] to-black/0', border: 'border-black/10' }
               ].map((tier, idx) => (
                 <div
                   key={idx}
-                  className={`bg-[#070B08] ${tier.border} rounded-2xl p-8 space-y-6 relative overflow-hidden group hover:border-[#7DFF66]/30 transition-all flex flex-col justify-between`}
+                  className={`bg-white ${tier.border} rounded-2xl p-8 space-y-6 relative overflow-hidden group hover:border-[#F2A93B]/40 transition-all flex flex-col justify-between`}
                 >
                   <div className={`absolute inset-0 bg-gradient-to-b ${tier.gradient} opacity-50`} />
 
                   <div className="relative space-y-4">
-                    <span className="text-[10px] font-mono tracking-widest text-[#7DFF66] font-bold uppercase">Tier 0{idx + 1}</span>
-                    <h3 className="text-2xl font-bold font-mono text-white">{tier.char}</h3>
-                    <p className="text-sm text-[#7E9384] font-mono">{tier.sub}</p>
+                    <span className="text-[10px] font-mono tracking-widest text-[#F2A93B] font-bold uppercase">Tier 0{idx + 1}</span>
+                    <h3 className="text-2xl font-bold font-mono text-[#0A0A0A]">{tier.char}</h3>
+                    <p className="text-sm text-[#6B6B6B] font-mono">{tier.sub}</p>
                   </div>
 
-                  <div className="relative pt-6 border-t border-[#7E9384]/15 flex items-baseline justify-between">
+                  <div className="relative pt-6 border-t border-black/10 flex items-baseline justify-between">
                     <div>
-                      <span className="text-4xl font-black text-white font-mono">{tier.price}</span>
-                      <span className="text-[#7E9384] text-xs font-mono"> / yr</span>
+                      <span className="text-4xl font-black text-[#0A0A0A] font-mono">{tier.price}</span>
+                      <span className="text-[#6B6B6B] text-xs font-mono"> / yr</span>
                     </div>
                     <button
                       onClick={() => {
                         setActiveTab('search');
                         setSearchQuery('');
                       }}
-                      className="p-2 bg-white/5 rounded-lg text-[#7DFF66] group-hover:bg-[#7DFF66] group-hover:text-[#070B08] transition-all"
+                      className="p-2 bg-black/[0.03] rounded-lg text-[#F2A93B] group-hover:bg-[#0A0A0A] group-hover:text-white transition-all"
                     >
                       <ArrowRight className="w-5 h-5" />
                     </button>
@@ -1842,15 +1981,15 @@ export default function App() {
             </div>
 
             {/* Network parameters table */}
-            <div className="max-w-3xl mx-auto bg-[#070B08]/40 border border-[#7E9384]/15 rounded-2xl p-6 space-y-4 font-mono text-xs">
-              <h4 className="text-sm font-bold text-white uppercase tracking-wider">Arc Network Deployment Parameters</h4>
-              <div className="grid grid-cols-2 gap-4 text-[#7E9384]">
-                <div>Chain ID: <span className="text-white">5042002</span></div>
-                <div>Native Gas Token: <span className="text-white">USDC (18 decimals)</span></div>
-                <div>Registry address: <span className="text-white break-all">{REGISTRY_ADDRESS}</span></div>
-                <div>Controller address: <span className="text-white break-all">{CONTROLLER_ADDRESS}</span></div>
-                <div>Resolver proxy: <span className="text-white break-all">{RESOLVER_ADDRESS}</span></div>
-                <div>Universal Resolver: <span className="text-white break-all">{UNIVERSAL_RESOLVER_ADDRESS}</span></div>
+            <div className="max-w-3xl mx-auto bg-[#FAFAFA] border border-black/10 rounded-2xl p-6 space-y-4 font-mono text-xs">
+              <h4 className="text-sm font-bold text-[#0A0A0A] uppercase tracking-wider">Arc Network Deployment Parameters</h4>
+              <div className="grid grid-cols-2 gap-4 text-[#6B6B6B]">
+                <div>Chain ID: <span className="text-[#0A0A0A]">5042002</span></div>
+                <div>Native Gas Token: <span className="text-[#0A0A0A]">USDC (18 decimals)</span></div>
+                <div>Registry address: <span className="text-[#0A0A0A] break-all">{REGISTRY_ADDRESS}</span></div>
+                <div>Controller address: <span className="text-[#0A0A0A] break-all">{CONTROLLER_ADDRESS}</span></div>
+                <div>Resolver proxy: <span className="text-[#0A0A0A] break-all">{RESOLVER_ADDRESS}</span></div>
+                <div>Universal Resolver: <span className="text-[#0A0A0A] break-all">{UNIVERSAL_RESOLVER_ADDRESS}</span></div>
               </div>
             </div>
           </section>
@@ -1860,30 +1999,30 @@ export default function App() {
         {activeTab === 'docs' && (
           <section className="space-y-8 max-w-4xl mx-auto">
             <div>
-              <h2 className="text-3xl font-black tracking-tight">Developer <span className="text-[#7DFF66]">Portal</span></h2>
-              <p className="text-[#7E9384] text-sm font-mono mt-1">INTEGRATE .ARC DOMAINS INTO YOUR PRODUCTS</p>
+              <h2 className="text-3xl font-black tracking-tight">Developer <span className="text-[#F2A93B]">Portal</span></h2>
+              <p className="text-[#6B6B6B] text-sm font-mono mt-1">INTEGRATE .ARC DOMAINS INTO YOUR PRODUCTS</p>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-              <div className="bg-[#070B08]/40 border border-[#7E9384]/15 rounded-2xl p-8 space-y-4">
-                <Shield className="w-8 h-8 text-[#7DFF66]" />
+              <div className="bg-[#FAFAFA] border border-black/10 rounded-2xl p-8 space-y-4">
+                <Shield className="w-8 h-8 text-[#F2A93B]" />
                 <h3 className="text-xl font-bold font-mono">Decimal Exactness Rule</h3>
-                <p className="text-sm text-[#7E9384] leading-relaxed">
+                <p className="text-sm text-[#6B6B6B] leading-relaxed">
                   Arc uses USDC as its native token with 18 decimals of precision, while standard ERC-20 USDC contracts use 6 decimals. Never mix their raw values without converting first!
                 </p>
-                <div className="bg-[#070B08] p-4 rounded-xl border border-white/5 font-mono text-xs text-[#7DFF66]">
+                <div className="bg-white p-4 rounded-xl border border-black/5 font-mono text-xs text-[#F2A93B]">
                   <div>DECIMALS_OFFSET = 12n</div>
                   <div>display = balanceWei / (10n ** 12n)</div>
                 </div>
               </div>
 
-              <div className="bg-[#070B08]/40 border border-[#7E9384]/15 rounded-2xl p-8 space-y-4">
-                <FileText className="w-8 h-8 text-[#7DFF66]" />
+              <div className="bg-[#FAFAFA] border border-black/10 rounded-2xl p-8 space-y-4">
+                <FileText className="w-8 h-8 text-[#F2A93B]" />
                 <h3 className="text-xl font-bold font-mono">Deterministic Finality</h3>
-                <p className="text-sm text-[#7E9384] leading-relaxed">
+                <p className="text-sm text-[#6B6B6B] leading-relaxed">
                   Arc is built with sub-second Byzantine Fault Tolerant (BFT) consensus. Once a transaction is included in a block, it is irreversibly settled. Rollbacks or reorganizations are mathematically impossible.
                 </p>
-                <div className="bg-[#070B08] p-4 rounded-xl border border-white/5 font-mono text-xs text-[#7DFF66]">
+                <div className="bg-white p-4 rounded-xl border border-black/5 font-mono text-xs text-[#F2A93B]">
                   <div>One confirmation = Final.</div>
                   <div>No confirmation wait buffers needed.</div>
                 </div>
@@ -1895,16 +2034,16 @@ export default function App() {
       </main>
 
       {/* --- Footer --- */}
-      <footer className="border-t border-[#7E9384]/10 bg-[#070B08] py-8 text-center text-xs font-mono text-[#7E9384] max-w-7xl mx-auto px-4">
+      <footer className="border-t border-black/10 bg-white py-8 text-center text-xs font-mono text-[#6B6B6B] max-w-7xl mx-auto px-4">
         <div className="flex flex-col sm:flex-row justify-between items-center gap-4">
           <p>&copy; 2026 .arc Name Service. All rights reserved.</p>
           <div className="flex gap-4">
-            <a href="https://testnet.arcscan.app/" target="_blank" rel="noopener noreferrer" className="hover:text-[#7DFF66] transition-colors flex items-center gap-1">
+            <a href="https://testnet.arcscan.app/" target="_blank" rel="noopener noreferrer" className="hover:text-[#F2A93B] transition-colors flex items-center gap-1">
               ArcScan Explorer
               <ExternalLink className="w-3.5 h-3.5" />
             </a>
             <span>·</span>
-            <a href="https://docs.arc.io/llms.txt" target="_blank" rel="noopener noreferrer" className="hover:text-[#7DFF66] transition-colors">
+            <a href="https://docs.arc.io/llms.txt" target="_blank" rel="noopener noreferrer" className="hover:text-[#F2A93B] transition-colors">
               Circle Docs
             </a>
           </div>
@@ -1924,49 +2063,49 @@ export default function App() {
               initial={{ scale: 0.95, y: 15 }}
               animate={{ scale: 1, y: 0 }}
               exit={{ scale: 0.95, y: 15 }}
-              className="bg-[#070B08] border border-[#7E9384]/20 rounded-2xl max-w-lg w-full p-6 space-y-6"
+              className="bg-white border border-black/15 rounded-2xl max-w-lg w-full p-6 space-y-6"
             >
               <div className="flex justify-between items-center">
                 <div>
-                  <h3 className="text-xl font-bold font-mono">Manage <span className="text-[#7DFF66]">{selectedDomain}.arc</span></h3>
-                  <span className="text-[10px] font-mono text-[#7E9384] block">CONFIGURE ON-CHAIN RECORD ATTRIBUTES</span>
+                  <h3 className="text-xl font-bold font-mono">Manage <span className="text-[#F2A93B]">{selectedDomain}.arc</span></h3>
+                  <span className="text-[10px] font-mono text-[#6B6B6B] block">CONFIGURE ON-CHAIN RECORD ATTRIBUTES</span>
                 </div>
-                <button onClick={() => setIsManagingRecords(false)} className="p-2 bg-white/5 rounded-full text-[#7E9384] hover:text-white transition-all">
+                <button onClick={() => setIsManagingRecords(false)} className="p-2 bg-black/[0.03] rounded-full text-[#6B6B6B] hover:text-[#0A0A0A] transition-all">
                   <X className="w-5 h-5" />
                 </button>
               </div>
 
               <div className="space-y-4">
                 <div className="space-y-1.5">
-                  <label className="text-xs font-mono text-[#7E9384] font-bold block uppercase">Primary Address Record</label>
+                  <label className="text-xs font-mono text-[#6B6B6B] font-bold block uppercase">Primary Address Record</label>
                   <input
                     type="text"
                     value={recordAddr}
                     onChange={(e) => setRecordAddr(e.target.value)}
                     placeholder="0x..."
-                    className="w-full bg-white/5 border border-white/10 rounded-lg p-2.5 font-mono text-sm outline-none focus:border-[#7DFF66]"
+                    className="w-full bg-black/[0.03] border border-black/10 rounded-lg p-2.5 font-mono text-sm outline-none focus:border-[#0A0A0A]"
                   />
                 </div>
 
                 <div className="space-y-1.5">
-                  <label className="text-xs font-mono text-[#7E9384] font-bold block uppercase">Twitter / X handle</label>
+                  <label className="text-xs font-mono text-[#6B6B6B] font-bold block uppercase">Twitter / X handle</label>
                   <input
                     type="text"
                     value={recordTwitter}
                     onChange={(e) => setRecordTwitter(e.target.value)}
                     placeholder="@username"
-                    className="w-full bg-white/5 border border-white/10 rounded-lg p-2.5 font-mono text-sm outline-none focus:border-[#7DFF66]"
+                    className="w-full bg-black/[0.03] border border-black/10 rounded-lg p-2.5 font-mono text-sm outline-none focus:border-[#0A0A0A]"
                   />
                 </div>
 
                 <div className="space-y-1.5">
-                  <label className="text-xs font-mono text-[#7E9384] font-bold block uppercase">Profile Description</label>
+                  <label className="text-xs font-mono text-[#6B6B6B] font-bold block uppercase">Profile Description</label>
                   <input
                     type="text"
                     value={recordDesc}
                     onChange={(e) => setRecordDesc(e.target.value)}
                     placeholder="Proud owner of an .arc Web3 ID"
-                    className="w-full bg-white/5 border border-white/10 rounded-lg p-2.5 font-mono text-sm outline-none focus:border-[#7DFF66]"
+                    className="w-full bg-black/[0.03] border border-black/10 rounded-lg p-2.5 font-mono text-sm outline-none focus:border-[#0A0A0A]"
                   />
                 </div>
               </div>
@@ -1974,14 +2113,14 @@ export default function App() {
               <div className="flex gap-4">
                 <button
                   onClick={() => setIsManagingRecords(false)}
-                  className="flex-1 border border-white/10 hover:bg-white/5 text-white font-mono text-xs py-3 rounded-lg uppercase"
+                  className="flex-1 border border-black/10 hover:bg-black/[0.03] text-[#0A0A0A] font-mono text-xs py-3 rounded-lg uppercase"
                 >
                   Cancel
                 </button>
                 <button
                   onClick={updateRecords}
                   disabled={isUpdatingRecord}
-                  className="flex-1 bg-[#7DFF66] hover:bg-[#8aff75] text-[#070B08] font-bold font-mono text-xs py-3 rounded-lg uppercase flex items-center justify-center gap-1.5"
+                  className="flex-1 bg-[#0A0A0A] hover:bg-[#1a1a1a] text-white font-bold font-mono text-xs py-3 rounded-lg uppercase flex items-center justify-center gap-1.5"
                 >
                   {isUpdatingRecord ? <RefreshCw className="w-4 h-4 animate-spin" /> : null}
                   Save Records
@@ -2005,30 +2144,30 @@ export default function App() {
               initial={{ scale: 0.95, y: 15 }}
               animate={{ scale: 1, y: 0 }}
               exit={{ scale: 0.95, y: 15 }}
-              className="bg-[#070B08] border border-[#7E9384]/20 rounded-2xl max-w-sm w-full p-6 space-y-6"
+              className="bg-white border border-black/15 rounded-2xl max-w-sm w-full p-6 space-y-6"
             >
               <div className="flex justify-between items-center">
                 <div>
-                  <h3 className="text-xl font-bold font-mono">List <span className="text-[#7DFF66]">{isListingToken}.arc</span></h3>
-                  <span className="text-[10px] font-mono text-[#7E9384] block">SET SECONDARY ASKING PRICE</span>
+                  <h3 className="text-xl font-bold font-mono">List <span className="text-[#F2A93B]">{isListingToken}.arc</span></h3>
+                  <span className="text-[10px] font-mono text-[#6B6B6B] block">SET SECONDARY ASKING PRICE</span>
                 </div>
-                <button onClick={() => setIsListingToken(null)} className="p-2 bg-white/5 rounded-full text-[#7E9384] hover:text-white transition-all">
+                <button onClick={() => setIsListingToken(null)} className="p-2 bg-black/[0.03] rounded-full text-[#6B6B6B] hover:text-[#0A0A0A] transition-all">
                   <X className="w-5 h-5" />
                 </button>
               </div>
 
               <div className="space-y-4">
                 <div className="space-y-1.5">
-                  <label className="text-xs font-mono text-[#7E9384] font-bold block uppercase">Asking Price (USDC)</label>
+                  <label className="text-xs font-mono text-[#6B6B6B] font-bold block uppercase">Asking Price (USDC)</label>
                   <div className="relative flex items-center">
                     <input
                       type="number"
                       value={listingPrice}
                       onChange={(e) => setListingPrice(e.target.value)}
                       placeholder="e.g. 50"
-                      className="w-full bg-white/5 border border-white/10 rounded-lg p-2.5 font-mono text-sm outline-none focus:border-[#7DFF66] pr-16"
+                      className="w-full bg-black/[0.03] border border-black/10 rounded-lg p-2.5 font-mono text-sm outline-none focus:border-[#0A0A0A] pr-16"
                     />
-                    <span className="absolute right-3 font-mono text-[#7E9384] text-xs">USDC</span>
+                    <span className="absolute right-3 font-mono text-[#6B6B6B] text-xs">USDC</span>
                   </div>
                 </div>
               </div>
@@ -2036,14 +2175,14 @@ export default function App() {
               <div className="flex gap-4">
                 <button
                   onClick={() => setIsListingToken(null)}
-                  className="flex-1 border border-white/10 hover:bg-white/5 text-white font-mono text-xs py-3 rounded-lg uppercase"
+                  className="flex-1 border border-black/10 hover:bg-black/[0.03] text-[#0A0A0A] font-mono text-xs py-3 rounded-lg uppercase"
                 >
                   Cancel
                 </button>
                 <button
                   onClick={submitListing}
                   disabled={isSubmittingListing || !listingPrice}
-                  className="flex-1 bg-[#7DFF66] hover:bg-[#8aff75] text-[#070B08] font-bold font-mono text-xs py-3 rounded-lg uppercase flex items-center justify-center gap-1.5"
+                  className="flex-1 bg-[#0A0A0A] hover:bg-[#1a1a1a] text-white font-bold font-mono text-xs py-3 rounded-lg uppercase flex items-center justify-center gap-1.5"
                 >
                   {isSubmittingListing ? <RefreshCw className="w-4 h-4 animate-spin" /> : null}
                   Confirm List
@@ -2061,7 +2200,7 @@ export default function App() {
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: 20 }}
-            className="fixed bottom-6 right-6 z-50 bg-[#7DFF66]/10 border border-[#7DFF66]/30 px-5 py-3 rounded-xl flex items-center gap-3 shadow-[0_4px_30px_rgba(125,255,102,0.1)] text-[#7DFF66] font-mono text-xs"
+            className="fixed bottom-6 right-6 z-50 bg-[#F2A93B]/10 border border-[#F2A93B]/40 px-5 py-3 rounded-xl flex items-center gap-3 shadow-md text-[#F2A93B] font-mono text-xs"
           >
             <CheckCircle2 className="w-5 h-5" />
             <span>{successToast}</span>
@@ -2083,4 +2222,3 @@ export default function App() {
     </div>
   );
 }
-
