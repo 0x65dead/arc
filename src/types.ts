@@ -48,7 +48,7 @@ export interface CommitmentState {
 export const NETWORK_INFO = {
   chainId: 5042002,
   chainName: 'Arc Testnet',
-  rpcUrl: 'https://rpc.testnet.arc.network',
+  rpcUrl: 'https://rpc.testnet.arc.io',
   explorerUrl: 'https://explorer.testnet.arc.network', // mock or real if exists
   currencySymbol: 'ARC',
   registryAddress: '0xCA78696791670CbC14eE802e6DcDfD661a458978',
