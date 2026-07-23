@@ -1,16 +1,21 @@
 import React, { useState, useEffect } from 'react';
-import { 
-  Search, Globe, FileText, Wallet, ExternalLink, Clock, ArrowRight, 
+import {
+  Search, Globe, FileText, Wallet, ExternalLink, Clock, ArrowRight,
   CheckCircle2, AlertCircle, X, Sparkles, RefreshCw, Copy, Check,
-  Menu, Shield, Settings, ShoppingBag
+  Menu, Shield, Settings, ShoppingBag, AlertTriangle
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import confetti from 'canvas-confetti';
 import { ethers } from 'ethers';
-import { 
-  useAccount, useConnect, useDisconnect, useWriteContract
+import {
+  useAccount, useConnect, useDisconnect, useWriteContract, usePublicClient
 } from 'wagmi';
 import { injected } from 'wagmi/connectors';
+import { parseAbi } from 'viem';
+import { useChainGuard, WrongChainError } from './hooks/useChainGuard';
+import {
+  fetchIndexerStats, fetchIndexerDomains, fetchIndexerMarketplace, fetchIndexerAvailability
+} from './lib/api';
 
 // --- Deployment Addresses ---
 const CONTROLLER_ADDRESS = '0x2FE2560B2FE6D54e50806F531223247CcfEd739B';
@@ -19,13 +24,14 @@ const RESOLVER_ADDRESS = '0x027d6dCc8F1235dfdd47E532e77909363C701E54';
 const MARKET_ADDRESS = '0xC94Ff1964840BdF8E6952455a2342Ffc6B0bA299';
 const REGISTRY_ADDRESS = '0xCA78696791670CbC14eE802e6DcDfD661a458978';
 const UNIVERSAL_RESOLVER_ADDRESS = '0xA3F364a558eb712AFbB4929df49e538A800438BC';
-const REVERSE_REGISTRAR_ADDRESS = '0x97cdcf037c1A8475eF5C9504A18C10b41f7DfDfB';
 
-// Block from which we start indexing on-chain events (contract deployment block)
+// Block from which we start indexing on-chain events (contract deployment block).
+// Only used by the client-side fallback scan below — the indexer keeps its
+// own checkpoint server-side (see /indexer/schema.sql sync_state table).
 const DEPLOY_BLOCK = 52346600;
 
 // --- Simplified ABIs for on-chain calls ---
-const CONTROLLER_ABI = [
+const CONTROLLER_ABI = parseAbi([
   'function available(string calldata nm) external view returns (bool)',
   'function valid(string calldata nm) external view returns (bool)',
   'function price(string memory nm, uint256 dur) public view returns (uint256)',
@@ -33,17 +39,16 @@ const CONTROLLER_ABI = [
   'function commit(bytes32 c) external',
   'function register(string calldata nm, address o, uint256 dur, bytes32 s) external payable',
   'function renew(string calldata nm, uint256 dur) external payable'
-];
+]);
 
-const RESOLVER_ABI = [
+const RESOLVER_ABI = parseAbi([
   'function addr(bytes32 node) external view returns (address)',
   'function text(bytes32 node, string calldata key) external view returns (string memory)',
   'function setAddr(bytes32 node, address a) external',
-  'function setText(bytes32 node, string calldata key, string calldata value) external',
-  'function setName(bytes32 node, string calldata n) external'
-];
+  'function setText(bytes32 node, string calldata key, string calldata value) external'
+]);
 
-const REGISTRAR_ABI = [
+const REGISTRAR_ABI = parseAbi([
   'function ownerOf(uint256 id) external view returns (address)',
   'function tokenURI(uint256 id) external view returns (string memory)',
   'function labels(uint256 id) external view returns (string memory)',
@@ -52,15 +57,15 @@ const REGISTRAR_ABI = [
   'function approve(address to, uint256 id) external',
   'function getApproved(uint256 id) external view returns (address)',
   'function nameExpires(uint256 id) external view returns (uint256)'
-];
+]);
 
-const MARKET_ABI = [
+const MARKET_ABI = parseAbi([
   'function listings(uint256 id) external view returns (address seller, uint256 price)',
   'function listingCurrency(uint256 id) external view returns (uint8)',
   'function list(uint256 id, uint256 price) external',
   'function unlist(uint256 id) external',
   'function buy(uint256 id, uint256 maxPrice) external payable'
-];
+]);
 
 // --- Custom Name Hash Helpers ---
 export function namehash(name: string): string {
@@ -80,42 +85,77 @@ export function labelToId(label: string): string {
 }
 
 // Fetch logs in bounded-size chunks to stay under RPC provider block-range caps.
+//
+// Unlike the previous version, a failed chunk is retried once before giving
+// up, and the caller is told explicitly via `failed: true` rather than
+// silently receiving a possibly-empty array indistinguishable from "there's
+// really nothing here." Every failure is also logged with a
+// "[ARC][scan-failure]" prefix and the exact block range, so opening devtools
+// during a bad load tells you immediately what went wrong (rate limit, block
+// range cap, timeout) instead of having to guess.
 async function fetchLogsWithChunking(
   provider: ethers.JsonRpcProvider,
   filter: { address: string; topics: any[] },
   startBlock: number,
   endBlock: number,
+  label: string,
   chunkSize: number = 10000
-): Promise<ethers.Log[]> {
+): Promise<{ logs: ethers.Log[]; failed: boolean }> {
   let currentBlock = startBlock;
   let allLogs: ethers.Log[] = [];
+  let failed = false;
 
   while (currentBlock <= endBlock) {
     const chunkEndBlock = Math.min(currentBlock + chunkSize - 1, endBlock);
-    try {
-      const logs = await provider.getLogs({
-        ...filter,
-        fromBlock: currentBlock,
-        toBlock: chunkEndBlock,
-      });
-      allLogs = allLogs.concat(logs);
-    } catch (err) {
-      console.warn(`Failed to fetch logs for blocks ${currentBlock}-${chunkEndBlock}:`, err);
-      break;
+    let attempt = 0;
+    let chunkOk = false;
+
+    while (attempt < 2 && !chunkOk) {
+      try {
+        const logs = await provider.getLogs({ ...filter, fromBlock: currentBlock, toBlock: chunkEndBlock });
+        allLogs = allLogs.concat(logs);
+        chunkOk = true;
+      } catch (err) {
+        attempt++;
+        console.error(
+          `[ARC][scan-failure] ${label} blocks ${currentBlock}-${chunkEndBlock} (attempt ${attempt}/2):`,
+          err
+        );
+        if (attempt < 2) {
+          await new Promise((r) => setTimeout(r, 500));
+        } else {
+          failed = true;
+        }
+      }
     }
+
+    if (failed) break; // stop this stream; caller must treat remaining data as incomplete
     currentBlock = chunkEndBlock + 1;
   }
-  return allLogs;
+
+  return { logs: allLogs, failed };
 }
 
+// Pre-seeded list of domains for the search-suggestion pills only.
+// IMPORTANT: this must never feed into stats or "names claimed" counts —
+// that was the exact cause of the "13 registered names" bug (13 is the
+// length of this array, not a number that ever came from the chain).
 const DEFAULT_TRACKED_DOMAINS = [
-  'first', 'arc', 'domain', 'test', 'alice', 'bob', 'charlie', 'degen', 'usdc', 'crypto', 'stable', 'finance', 'finality', 'second', 'prime', 'usdc1', 'a4'
+  'first', 'arc', 'domain', 'test', 'alice', 'bob', 'charlie', 'degen', 'usdc', 'crypto', 'stable', 'finance', 'finality'
 ];
 
 export function parseRevertReason(err: any): string {
   if (!err) return 'Unknown error occurred.';
+
+  if (err instanceof WrongChainError) {
+    return 'Please switch your wallet to Arc Testnet to continue.';
+  }
+  if (err instanceof TxRevertedError) {
+    return 'Transaction was mined but reverted on-chain — no changes were made and gas was still spent. Check the transaction on ArcScan for the revert reason.';
+  }
+
   const message = err.message || '';
-  
+
   if (message.includes('!owner')) return 'Error: Not the owner of this domain.';
   if (message.includes('!minted')) return 'Error: Domain has not been minted.';
   if (message.includes('early')) return 'Error: Commitment is too young. Please wait for the 60-second delay.';
@@ -128,23 +168,37 @@ export function parseRevertReason(err: any): string {
   if (message.includes('!listed')) return 'Error: Domain is not listed in the marketplace.';
   if (message.includes('price moved')) return 'Error: Listing price has changed.';
   if (message.includes('seller changed')) return 'Error: Owner of the domain has changed.';
-  
+
   const revertMatch = message.match(/reverted with reason "([^"]+)"/) || message.match(/revert:? ([\w! ]+)/i);
   if (revertMatch && revertMatch[1]) {
     return `Transaction reverted: ${revertMatch[1]}`;
   }
-  
+
   return message.slice(0, 120) + (message.length > 120 ? '...' : '');
 }
 
+// A transaction that got mined but reverted still returns a receipt — it
+// does NOT throw. Every write flow needs to check receipt.status explicitly
+// or it will show confetti/success for a no-op transaction (this was the
+// root cause behind "claimed successfully but shows available again").
+class TxRevertedError extends Error {
+  constructor(public receipt: unknown) {
+    super('Transaction reverted on-chain');
+  }
+}
+
 export default function App() {
+  // Navigation
   const [activeTab, setActiveTab] = useState<'search' | 'my-domains' | 'marketplace' | 'explorer' | 'docs'>('search');
   const [isMenuOpen, setIsMenuOpen] = useState(false);
 
+  // Wagmi Connection Hooks
   const { address, isConnected } = useAccount();
   const { connect } = useConnect();
   const { disconnect } = useDisconnect();
+  const { ensureCorrectChain } = useChainGuard();
 
+  // Local state for searched & registered names
   const [trackedNames, setTrackedNames] = useState<string[]>(() => {
     const saved = localStorage.getItem('arc_tracked_names');
     if (saved) {
@@ -158,6 +212,7 @@ export default function App() {
     return DEFAULT_TRACKED_DOMAINS;
   });
 
+  // Track state of user's commitment flow in local storage to prevent loss on refresh
   const [activeCommitment, setActiveCommitment] = useState<{
     name: string;
     secret: string;
@@ -178,6 +233,7 @@ export default function App() {
     return null;
   });
 
+  // Inputs
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResult, setSearchResult] = useState<{
     name: string;
@@ -190,13 +246,16 @@ export default function App() {
     resolver?: string;
   } | null>(null);
 
+  // Core loading states
   const [isSearching, setIsSearching] = useState(false);
   const [countdown, setCountdown] = useState(0);
 
+  // Toasts
   const [successToast, setSuccessToast] = useState<string | null>(null);
   const [errorToast, setErrorToast] = useState<string | null>(null);
   const [copiedName, setCopiedName] = useState<string | null>(null);
 
+  // Selected domain for record management
   const [selectedDomain, setSelectedDomain] = useState<string | null>(null);
   const [isManagingRecords, setIsManagingRecords] = useState(false);
   const [recordAddr, setRecordAddr] = useState('');
@@ -204,9 +263,22 @@ export default function App() {
   const [recordDesc, setRecordDesc] = useState('');
   const [isUpdatingRecord, setIsUpdatingRecord] = useState(false);
 
+  // Dynamic on-chain statistics states
   const [statsRevenue, setStatsRevenue] = useState('0.00');
   const [statsNamesCount, setStatsNamesCount] = useState('0');
 
+  // Set whenever displayed data might be incomplete: indexer unreachable AND
+  // the client-side fallback scan also hit a failure, or is simply the
+  // slower/best-effort path. This is the visible signal that used to be
+  // missing entirely — previously a failed scan looked identical to a
+  // successful one that happened to return real data.
+  const [dataSourceWarning, setDataSourceWarning] = useState<string | null>(null);
+  // The exact reason the indexer calls failed, shown in the banner itself —
+  // so a fetch failure is diagnosable straight from the page on a phone,
+  // without needing to plug into a PC for devtools every time.
+  const [indexerErrorDetail, setIndexerErrorDetail] = useState<string | null>(null);
+
+  // Marketplace states
   const [marketplaceListings, setMarketplaceListings] = useState<Array<{
     name: string;
     id: string;
@@ -214,7 +286,8 @@ export default function App() {
     seller: string;
     isUSDCListing: boolean;
   }>>([]);
-  
+
+  // User Domains state
   const [userDomains, setUserDomains] = useState<Array<{
     name: string;
     id: string;
@@ -225,93 +298,53 @@ export default function App() {
   }>>([]);
   const [isLoadingDomains, setIsLoadingDomains] = useState(false);
 
+  // Listing states
   const [isListingToken, setIsListingToken] = useState<string | null>(null);
   const [listingPrice, setListingPrice] = useState('');
   const [isSubmittingListing, setIsSubmittingListing] = useState(false);
 
+  // Wagmi Write Contract Hook
   const { writeContractAsync } = useWriteContract();
+  const publicClient = usePublicClient();
+
+  // writeContractAsync only resolves once the wallet returns a tx hash, not
+  // once the tx is mined — and waitForTransactionReceipt resolves on ANY
+  // mined status, success or revert. A reverted tx still produces a valid
+  // receipt, so every caller used to treat "got mined" as "succeeded."
+  // Checking receipt.status here is what makes a reverted register/renew/etc
+  // actually show an error instead of confetti.
+  const waitForTx = async (hash: `0x${string}`) => {
+    if (!publicClient) return;
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    if (receipt.status !== 'success') {
+      throw new TxRevertedError(receipt);
+    }
+    return receipt;
+  };
 
   const [isRenewing, setIsRenewing] = useState<string | null>(null);
-
-  // Primary Name states
-  const [primaryName, setPrimaryName] = useState<string | null>(null);
-  const [primaryPromptName, setPrimaryPromptName] = useState<string | null>(null);
-  const [isSettingPrimary, setIsSettingPrimary] = useState<string | null>(null);
-
-  const fetchPrimaryName = async (userAddress: string) => {
-    try {
-      const provider = new ethers.JsonRpcProvider('https://rpc.testnet.arc.network');
-      const universalResolver = new ethers.Contract(UNIVERSAL_RESOLVER_ADDRESS, [
-        'function reverse(address a) external view returns (string memory name, bool verified)'
-      ], provider);
-      const [name, verified] = await universalResolver.reverse(userAddress);
-      setPrimaryName(verified && name ? name : null);
-    } catch (err) {
-      setPrimaryName(null);
-    }
-  };
-
-  useEffect(() => {
-    if (address) {
-      fetchPrimaryName(address);
-    } else {
-      setPrimaryName(null);
-    }
-  }, [address]);
-
-  const handleSetPrimaryName = async (name: string) => {
-    if (!address) return;
-    setIsSettingPrimary(name);
-    try {
-      showSuccess('Step 1: Claiming reverse node...');
-      await writeContractAsync({
-        address: REVERSE_REGISTRAR_ADDRESS,
-        abi: ['function claim() returns (bytes32)'],
-        functionName: 'claim',
-        gas: 150000n
-      });
-
-      const provider = new ethers.JsonRpcProvider('https://rpc.testnet.arc.network');
-      const reverseReg = new ethers.Contract(REVERSE_REGISTRAR_ADDRESS, ['function node(address) view returns (bytes32)'], provider);
-      const node = await reverseReg.node(address);
-
-      showSuccess('Step 2: Setting primary name on Resolver...');
-      await writeContractAsync({
-        address: RESOLVER_ADDRESS,
-        abi: ['function setName(bytes32, string)'],
-        functionName: 'setName',
-        args: [node, `${name}.arc`],
-        gas: 100000n
-      });
-
-      showSuccess(`Successfully set ${name}.arc as your Primary Name!`);
-      setPrimaryName(`${name}.arc`);
-      setPrimaryPromptName(null); 
-    } catch (err: any) {
-      showError(parseRevertReason(err));
-    } finally {
-      setIsSettingPrimary(null);
-    }
-  };
 
   const triggerRenew = async (name: string) => {
     if (!address) return;
     setIsRenewing(name);
     try {
+      await ensureCorrectChain();
+
       showSuccess(`Estimating renewal cost for ${name}.arc...`);
       const provider = new ethers.JsonRpcProvider('https://rpc.testnet.arc.network');
       const controller = new ethers.Contract(CONTROLLER_ADDRESS, CONTROLLER_ABI, provider);
-      const priceWei = await controller.price(name, 31536000);
+      const priceWei = await controller.price(name, 31536000); // 1 year renewal
 
       showSuccess(`Please approve the renewal transaction for ${name}.arc in your wallet...`);
-      await writeContractAsync({
+      const tx = await writeContractAsync({
         address: CONTROLLER_ADDRESS,
         abi: CONTROLLER_ABI,
         functionName: 'renew',
-        args: [name, 31536000],
-        value: BigInt(priceWei.toString()),
-        gas: 300000n
+        args: [name, 31536000n],
+        value: BigInt(priceWei.toString()) // Paid in native USDC gas token (18 decimals)
       });
+      showSuccess('Confirming renewal on-chain...');
+      await waitForTx(tx);
       showSuccess(`Successfully renewed ${name}.arc for 1 year!`);
       fetchDomainsAndListings();
     } catch (err: any) {
@@ -322,6 +355,7 @@ export default function App() {
     }
   };
 
+  // Save tracked domains to local storage
   const addTrackedName = (name: string) => {
     const cleaned = name.trim().toLowerCase().replace('.arc', '');
     if (!cleaned) return;
@@ -332,6 +366,7 @@ export default function App() {
     });
   };
 
+  // Toast helper
   const showSuccess = (msg: string) => {
     setSuccessToast(msg);
     setTimeout(() => setSuccessToast(null), 4000);
@@ -342,12 +377,14 @@ export default function App() {
     setTimeout(() => setErrorToast(null), 4000);
   };
 
+  // Copy helper
   const handleCopy = (text: string, label: string) => {
     navigator.clipboard.writeText(text);
     setCopiedName(label);
     setTimeout(() => setCopiedName(null), 1500);
   };
 
+  // Keep commitment state synchronized
   useEffect(() => {
     if (activeCommitment) {
       localStorage.setItem('arc_active_commitment', JSON.stringify(activeCommitment));
@@ -356,6 +393,7 @@ export default function App() {
     }
   }, [activeCommitment]);
 
+  // Handle countdown timer for reveal delay
   useEffect(() => {
     let interval: NodeJS.Timeout;
     if (activeCommitment && activeCommitment.step === 'waiting') {
@@ -380,13 +418,14 @@ export default function App() {
     return () => clearInterval(interval);
   }, [activeCommitment]);
 
+  // --- Real RPC Reading ---
   const handleSearchOnChain = async (e?: React.FormEvent, forcedQuery?: string) => {
     if (e) e.preventDefault();
     const query = (forcedQuery !== undefined ? forcedQuery : searchQuery).trim().toLowerCase().replace('.arc', '');
     if (!query) return;
 
-    // Allow lowercase letters, numbers, dashes, and UTF-8 characters (emojis)
-    const isValid = /^[a-z0-9-\u0000-\uffff]+$/.test(query) && query.length >= 2;
+    // Check validity locally first (only lowercase, digits, dashes)
+    const isValid = /^[a-z0-9-]+$/.test(query) && query.length >= 2;
     if (!isValid) {
       setSearchResult({
         name: query,
@@ -403,24 +442,55 @@ export default function App() {
     try {
       const provider = new ethers.JsonRpcProvider('https://rpc.testnet.arc.network');
       const controller = new ethers.Contract(CONTROLLER_ADDRESS, CONTROLLER_ABI, provider);
-      
-      const isAvailable = await controller.available(query);
-      const priceWei = await controller.price(query, 31536000);
+
+      // Price stays a live on-chain read regardless of indexer availability —
+      // it's a cheap, gas-free view call, and it's the contract's own
+      // pricing logic. Duplicating those tiers into the DB (or hardcoding
+      // them client-side) would just create a second place that can drift
+      // if the contract's pricing ever changes.
+      const priceWei = await controller.price(query, 31536000); // 1 year
       const priceFormatted = ethers.formatEther(priceWei);
 
+      let isAvailable: boolean;
       let ownerAddress = '';
       let resolverAddress = '';
-      if (!isAvailable) {
-        try {
-          const registry = new ethers.Contract(REGISTRY_ADDRESS, [
-            'function owner(bytes32 node) view returns (address)',
-            'function resolver(bytes32 node) view returns (address)'
-          ], provider);
-          const node = namehash(`${query}.arc`);
-          ownerAddress = await registry.owner(node);
-          resolverAddress = await registry.resolver(node);
-        } catch (e) {
-          console.warn('Could not read owner/resolver:', e);
+
+      try {
+        // Indexer-first: answers instantly from Postgres instead of an RPC
+        // round-trip. This is a fast hint, not the final word — the actual
+        // register() transaction is still what enforces "not already taken"
+        // on-chain, so a few seconds of indexer lag (the live listener
+        // usually catches a new registration within seconds) can't cause a
+        // real double-registration — worst case is a revert at reveal time,
+        // which is already surfaced as a clear error, not silent failure.
+        const avail = await fetchIndexerAvailability(query);
+        isAvailable = !avail.taken;
+        if (avail.taken && avail.owner) {
+          ownerAddress = avail.owner;
+          try {
+            const registry = new ethers.Contract(REGISTRY_ADDRESS, [
+              'function resolver(bytes32 node) view returns (address)'
+            ], provider);
+            resolverAddress = await registry.resolver(namehash(`${query}.arc`));
+          } catch (e) {
+            console.warn('Could not read resolver record:', e);
+          }
+        }
+      } catch (indexerErr) {
+        console.warn('[ARC] indexer availability check failed, falling back to on-chain read:', indexerErr);
+        isAvailable = await controller.available(query);
+        if (!isAvailable) {
+          try {
+            const registry = new ethers.Contract(REGISTRY_ADDRESS, [
+              'function owner(bytes32 node) view returns (address)',
+              'function resolver(bytes32 node) view returns (address)'
+            ], provider);
+            const node = namehash(`${query}.arc`);
+            ownerAddress = await registry.owner(node);
+            resolverAddress = await registry.resolver(node);
+          } catch (e) {
+            console.warn('Could not read owner/resolver:', e);
+          }
         }
       }
 
@@ -438,10 +508,11 @@ export default function App() {
       });
       addTrackedName(query);
     } catch (err: any) {
-      console.error('Error querying onchain:', err);
+      console.error('[ARC][scan-failure] on-chain search query failed:', err);
+      // Fallback calculations in case RPC is congested
       const len = query.length;
       let cost = '5';
-      if (len === 2) cost = '1000';
+      if (len === 2) cost = '2.0';
       else if (len === 3) cost = '640';
       else if (len === 4) cost = '160';
 
@@ -461,6 +532,7 @@ export default function App() {
     }
   };
 
+  // Debounced search-as-you-type trigger
   useEffect(() => {
     const query = searchQuery.trim().toLowerCase().replace('.arc', '');
     if (!query || query.length < 2) {
@@ -470,11 +542,12 @@ export default function App() {
 
     const timer = setTimeout(() => {
       handleSearchOnChain(undefined, query);
-    }, 450);
+    }, 450); // 450ms debounce delay
 
     return () => clearTimeout(timer);
   }, [searchQuery]);
 
+  // --- STEP 1: COMMIT NAME ---
   const triggerCommit = async () => {
     if (!searchResult || !isConnected || !address) {
       showError('Please connect your Web3 wallet first!');
@@ -482,10 +555,13 @@ export default function App() {
     }
 
     try {
+      await ensureCorrectChain();
+
+      // 1. Generate secret & commitment
       const secret = ethers.hexlify(ethers.randomBytes(32));
       const provider = new ethers.JsonRpcProvider('https://rpc.testnet.arc.network');
       const controller = new ethers.Contract(CONTROLLER_ADDRESS, CONTROLLER_ABI, provider);
-      
+
       const hash = await controller.makeCommitment(searchResult.name, address, secret);
 
       setActiveCommitment({
@@ -497,14 +573,21 @@ export default function App() {
         step: 'committing'
       });
 
+      // 2. Broadcast Transaction
       showSuccess('Please approve the commitment transaction in your wallet...');
       const tx = await writeContractAsync({
         address: CONTROLLER_ADDRESS,
         abi: CONTROLLER_ABI,
         functionName: 'commit',
-        args: [hash],
-        gas: 300000n
+        args: [hash]
       });
+
+      // Wait for the commit to actually be mined (and succeed) before
+      // starting the countdown — minCommitAge/maxCommitAge are enforced
+      // against the mined block timestamp, not against when the wallet
+      // returned this hash.
+      showSuccess('Waiting for commitment to confirm on-chain...');
+      await waitForTx(tx);
 
       setActiveCommitment(prev => prev ? {
         ...prev,
@@ -513,7 +596,7 @@ export default function App() {
         txHash: tx
       } : null);
 
-      showSuccess('Commitment successfully submitted! Beginning 60s maturity countdown...');
+      showSuccess('Commitment confirmed! Beginning 60s maturity countdown...');
     } catch (err: any) {
       console.error('Commit failed:', err);
       setActiveCommitment(null);
@@ -521,10 +604,23 @@ export default function App() {
     }
   };
 
+  // --- STEP 3: REVEAL AND REGISTER ---
   const triggerRegister = async () => {
     if (!activeCommitment || !address) return;
 
+    // The commitment hash was computed on-chain from activeCommitment.owner at
+    // commit time. If the wallet has since switched accounts, registering
+    // with the live `address` would produce a different hash than what was
+    // committed and revert with "commit expired" instead of registering.
+    if (address.toLowerCase() !== activeCommitment.owner.toLowerCase()) {
+      showError('Connected wallet has changed since you committed this name. Please reconnect the original account and try again.');
+      setActiveCommitment(prev => prev ? { ...prev, step: 'ready' } : null);
+      return;
+    }
+
     try {
+      await ensureCorrectChain();
+
       setActiveCommitment(prev => prev ? { ...prev, step: 'registering' } : null);
       showSuccess('Estimating cost and preparing registration transaction...');
 
@@ -538,26 +634,28 @@ export default function App() {
         functionName: 'register',
         args: [
           activeCommitment.name,
-          address,
-          31536000,
-          activeCommitment.secret
+          activeCommitment.owner as `0x${string}`,
+          31536000n, // 1 year duration
+          activeCommitment.secret as `0x${string}`
         ],
-        value: BigInt(priceWei.toString()),
-        gas: 500000n
+        value: BigInt(priceWei.toString()) // Paid in native USDC gas token (18 decimals)
       });
+
+      showSuccess('Confirming registration on-chain...');
+      await waitForTx(tx); // throws TxRevertedError if this actually reverted
 
       confetti({ particleCount: 200, spread: 80, origin: { y: 0.6 } });
       showSuccess(`Successfully registered ${activeCommitment.name}.arc!`);
-      
+
       setActiveCommitment(prev => prev ? { ...prev, step: 'completed', txHash: tx } : null);
       addTrackedName(activeCommitment.name);
-      
+
+      // Clear commitment after 5s
       setTimeout(() => {
         setActiveCommitment(null);
         setSearchResult(null);
         setSearchQuery('');
         setActiveTab('my-domains');
-        setPrimaryPromptName(activeCommitment.name);
       }, 5000);
     } catch (err: any) {
       console.error('Registration failed:', err);
@@ -566,232 +664,389 @@ export default function App() {
     }
   };
 
-  const fetchDomainsAndListings = async () => {
-    setIsLoadingDomains(true);
+  // --- Fallback: reconstruct domains/listings/stats directly from chain logs ---
+  // Only used when the indexer API is unreachable. Same log-scanning approach
+  // as before, but: (1) failed chunks are retried and explicitly reported
+  // rather than silently truncated, (2) stats never fall back to the
+  // DEFAULT_TRACKED_DOMAINS length, and (3) a clear dataSourceWarning is set
+  // whenever a stream fails so the UI visibly reflects incomplete data
+  // instead of quietly showing whatever partial numbers came back.
+  const fetchDomainsAndListingsFromChain = async () => {
+    const provider = new ethers.JsonRpcProvider('https://rpc.testnet.arc.network');
+    const latestBlock = await provider.getBlockNumber();
 
-    try {
-      const provider = new ethers.JsonRpcProvider('https://rpc.testnet.arc.network');
-      const latestBlock = await provider.getBlockNumber();
+    const listResults: typeof userDomains = [];
+    const marketResults: typeof marketplaceListings = [];
+    const warnings: string[] = [];
 
-      const listResults: typeof userDomains = [];
-      const marketResults: typeof marketplaceListings = [];
+    const controllerInterface = new ethers.Interface([
+      'event NameRegistered(string name, bytes32 indexed label, address indexed owner, uint256 cost, uint256 expires)',
+      'event NameRenewed(string name, bytes32 indexed label, uint256 cost, uint256 expires)'
+    ]);
+    const marketInterface = new ethers.Interface([
+      'event Listed(uint256 indexed id, address indexed seller, uint256 price)',
+      'event PriceChanged(uint256 indexed id, address indexed seller, uint256 price)',
+      'event Unlisted(uint256 indexed id, address indexed seller)',
+      'event Sold(uint256 indexed id, address indexed seller, address indexed buyer, uint256 price, uint256 fee)'
+    ]);
 
-      const controllerInterface = new ethers.Interface([
-        'event NameRegistered(string name, bytes32 indexed label, address indexed owner, uint256 cost, uint256 expires)',
-        'event NameRenewed(string name, bytes32 indexed label, uint256 cost, uint256 expires)'
-      ]);
+    // Used only to guess a human-readable name for a token id when rendering
+    // the marketplace — never used to compute a count or a revenue figure.
+    const nameGuessCandidates = new Set<string>(DEFAULT_TRACKED_DOMAINS);
+    const registeredNamesCount = new Set<string>();
 
-      const marketInterface = new ethers.Interface([
-        'event Listed(uint256 indexed id, address indexed seller, uint256 price)',
-        'event PriceChanged(uint256 indexed id, address indexed seller, uint256 price)',
-        'event Unlisted(uint256 indexed id, address indexed seller)',
-        'event Sold(uint256 indexed id, address indexed seller, address indexed buyer, uint256 price, uint256 fee)'
-      ]);
+    const { logs: registeredLogs, failed: registeredFailed } = await fetchLogsWithChunking(
+      provider,
+      { address: CONTROLLER_ADDRESS, topics: [ethers.id('NameRegistered(string,bytes32,address,uint256,uint256)')] },
+      DEPLOY_BLOCK,
+      latestBlock,
+      'NameRegistered'
+    );
+    if (registeredFailed) warnings.push('registration history');
 
-      const discoveredNames = new Set<string>(DEFAULT_TRACKED_DOMAINS);
-      const registeredNamesCount = new Set<string>();
-
+    registeredLogs.forEach(log => {
       try {
-        const registeredLogs = await fetchLogsWithChunking(
-          provider,
-          { address: CONTROLLER_ADDRESS, topics: [ethers.id("NameRegistered(string,bytes32,address,uint256,uint256)")] },
-          DEPLOY_BLOCK,
-          latestBlock
-        );
+        const parsed = controllerInterface.parseLog(log);
+        if (parsed) {
+          const cleaned = String(parsed.args.name).trim().toLowerCase().replace('.arc', '');
+          if (cleaned) {
+            nameGuessCandidates.add(cleaned);
+            registeredNamesCount.add(cleaned);
+          }
+        }
+      } catch (e) {
+        console.warn('Failed to parse NameRegistered log:', e);
+      }
+    });
 
-        registeredLogs.forEach(log => {
-          try {
-            const parsed = controllerInterface.parseLog(log);
-            if (parsed) {
-              const { name } = parsed.args;
-              const cleaned = name.trim().toLowerCase().replace('.arc', '');
-              if (cleaned) {
-                discoveredNames.add(cleaned);
-                registeredNamesCount.add(cleaned);
-              }
-            }
-          } catch (e) {}
-        });
-      } catch (logErr) {}
-
-      let totalRevenueWei = 0n;
+    // TOTAL REVENUE = lifetime gross volume, i.e. the sum of 'cost' across
+    // every NameRegistered + NameRenewed event.
+    let totalRevenueWei = 0n;
+    registeredLogs.forEach(log => {
       try {
-        const revenueLogs = await fetchLogsWithChunking(
-          provider,
-          { address: CONTROLLER_ADDRESS, topics: [ethers.id("NameRegistered(string,bytes32,address,uint256,uint256)")] },
-          DEPLOY_BLOCK,
-          latestBlock
-        );
+        const parsed = controllerInterface.parseLog(log);
+        if (parsed) totalRevenueWei += BigInt(parsed.args.cost.toString());
+      } catch { /* already warned above */ }
+    });
 
-        revenueLogs.forEach(log => {
-          try {
-            const parsed = controllerInterface.parseLog(log);
-            if (parsed) {
-              totalRevenueWei += BigInt(parsed.args.cost.toString());
+    const { logs: renewedLogs, failed: renewedFailed } = await fetchLogsWithChunking(
+      provider,
+      { address: CONTROLLER_ADDRESS, topics: [ethers.id('NameRenewed(string,bytes32,uint256,uint256)')] },
+      DEPLOY_BLOCK,
+      latestBlock,
+      'NameRenewed'
+    );
+    if (renewedFailed) warnings.push('renewal history');
+
+    renewedLogs.forEach(log => {
+      try {
+        const parsed = controllerInterface.parseLog(log);
+        if (parsed) totalRevenueWei += BigInt(parsed.args.cost.toString());
+      } catch (e) {
+        console.warn('Failed to parse NameRenewed log:', e);
+      }
+    });
+
+    const formattedRevenue = parseFloat(ethers.formatEther(totalRevenueWei));
+    setStatsRevenue(formattedRevenue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+
+    const { logs: mintLogs, failed: mintFailed } = await fetchLogsWithChunking(
+      provider,
+      {
+        address: REGISTRAR_ADDRESS,
+        topics: [ethers.id('Transfer(address,address,uint256)'), ethers.zeroPadValue(ethers.ZeroAddress, 32)]
+      },
+      DEPLOY_BLOCK,
+      latestBlock,
+      'Transfer(mint)'
+    );
+    if (mintFailed) warnings.push('mint history');
+    const mintsCount = mintLogs.length;
+
+    // NAMES CLAIMED: prefer the exact mint count, then the registered-name
+    // count. If both are 0 *and* a scan failed, we genuinely don't know the
+    // real number — show that honestly instead of guessing.
+    const scanFailedForCount = mintFailed || registeredFailed;
+    let finalNamesCount: number | null;
+    if (mintsCount > 0) finalNamesCount = mintsCount;
+    else if (registeredNamesCount.size > 0) finalNamesCount = registeredNamesCount.size;
+    else if (scanFailedForCount) finalNamesCount = null;
+    else finalNamesCount = 0;
+
+    setStatsNamesCount(finalNamesCount === null ? '—' : finalNamesCount.toLocaleString());
+
+    // Helper map for token IDs -> best-guess names, for marketplace display only
+    const idToNameMap = new Map<string, string>();
+    nameGuessCandidates.forEach(name => idToNameMap.set(labelToId(name), name));
+
+    const { logs: listedLogs, failed: listedFailed } = await fetchLogsWithChunking(
+      provider,
+      { address: MARKET_ADDRESS, topics: [ethers.id('Listed(uint256,address,uint256)')] },
+      DEPLOY_BLOCK,
+      latestBlock,
+      'Listed'
+    );
+    if (listedFailed) warnings.push('marketplace listings');
+
+    const uniqueTokenIds = new Set<string>();
+    listedLogs.forEach(log => {
+      try {
+        const parsed = marketInterface.parseLog(log);
+        if (parsed) uniqueTokenIds.add(parsed.args.id.toString());
+      } catch (e) {
+        console.warn('Failed to parse Listed log:', e);
+      }
+    });
+
+    const marketContract = new ethers.Contract(MARKET_ADDRESS, MARKET_ABI, provider);
+    await Promise.all(Array.from(uniqueTokenIds).map(async (idStr) => {
+      try {
+        const id = BigInt(idStr);
+        const listing = await marketContract.listings(id);
+        const seller = listing[0];
+        const price = listing[1];
+
+        if (seller && seller !== ethers.ZeroAddress) {
+          let name = idToNameMap.get(idStr);
+          if (!name) {
+            try {
+              const registrarContract = new ethers.Contract(REGISTRAR_ADDRESS, ['function labels(uint256) view returns (string)'], provider);
+              name = await registrarContract.labels(id);
+            } catch {
+              name = '';
             }
-          } catch (e) {}
-        });
+          }
+          if (!name) name = `Token #${idStr.slice(0, 6)}`;
 
-        if (totalRevenueWei === 0n) {
-          totalRevenueWei = await provider.getBalance(CONTROLLER_ADDRESS);
+          marketResults.push({ name, id: idStr, price: ethers.formatEther(price), seller, isUSDCListing: false });
         }
       } catch (err) {
-        try {
-          totalRevenueWei = await provider.getBalance(CONTROLLER_ADDRESS);
-        } catch {}
+        console.warn(`Failed to fetch onchain listing detail for token ${idStr}:`, err);
       }
+    }));
 
-      const formattedRevenue = parseFloat(ethers.formatEther(totalRevenueWei));
-      setStatsRevenue(formattedRevenue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+    // Filter user owned domains from Transfer events filtered by to: userAddress
+    if (isConnected && address) {
+      const paddedAddress = ethers.zeroPadValue(address, 32);
+      const { logs: transferLogs, failed: transferFailed } = await fetchLogsWithChunking(
+        provider,
+        { address: REGISTRAR_ADDRESS, topics: [ethers.id('Transfer(address,address,uint256)'), null, paddedAddress] },
+        DEPLOY_BLOCK,
+        latestBlock,
+        'Transfer(to=user)'
+      );
+      if (transferFailed) warnings.push('your domain ownership history');
 
-      let mintsCount = 0;
-      try {
-        const mintLogs = await fetchLogsWithChunking(
-          provider,
-          { address: REGISTRAR_ADDRESS, topics: [ethers.id("Transfer(address,address,uint256)"), ethers.zeroPadValue(ethers.ZeroAddress, 32)] },
-          DEPLOY_BLOCK,
-          latestBlock
-        );
-        mintsCount = mintLogs.length;
-      } catch (mintErr) {}
+      const ownedTokenIds = new Set<string>();
+      const registrarInterface = new ethers.Interface(['event Transfer(address indexed from, address indexed to, uint256 indexed id)']);
 
-      const fallbackSize = registeredNamesCount.size > 0 ? registeredNamesCount.size : discoveredNames.size;
-      const finalNamesCount = mintsCount > 0 ? mintsCount : fallbackSize;
-      setStatsNamesCount(finalNamesCount.toLocaleString());
-
-      const idToNameMap = new Map<string, string>();
-      discoveredNames.forEach(name => {
-        idToNameMap.set(labelToId(name), name);
+      transferLogs.forEach(log => {
+        try {
+          const parsed = registrarInterface.parseLog(log);
+          if (parsed && parsed.args && parsed.args.id !== undefined) {
+            ownedTokenIds.add(parsed.args.id.toString());
+          } else if (log.topics[3]) {
+            ownedTokenIds.add(BigInt(log.topics[3]).toString());
+          }
+        } catch (e) {
+          try {
+            if (log.topics[3]) ownedTokenIds.add(BigInt(log.topics[3]).toString());
+          } catch (innerErr) {
+            console.warn('Failed to parse Transfer log:', e);
+          }
+        }
       });
 
-      try {
-        const listedLogs = await fetchLogsWithChunking(
-          provider,
-          { address: MARKET_ADDRESS, topics: [ethers.id("Listed(uint256,address,uint256)")] },
-          DEPLOY_BLOCK,
-          latestBlock
-        );
+      const registrarContract = new ethers.Contract(REGISTRAR_ADDRESS, [
+        'function tokenURI(uint256) view returns (string)',
+        'function labels(uint256) view returns (string)',
+        'function nameExpires(uint256) view returns (uint256)',
+        'function ownerOf(uint256) view returns (address)'
+      ], provider);
 
-        const uniqueTokenIds = new Set<string>();
-        listedLogs.forEach(log => {
-          try {
-            const parsed = marketInterface.parseLog(log);
-            if (parsed) {
-              uniqueTokenIds.add(parsed.args.id.toString());
-            }
-          } catch (e) {}
-        });
-
-        const marketContract = new ethers.Contract(MARKET_ADDRESS, MARKET_ABI, provider);
-        await Promise.all(Array.from(uniqueTokenIds).map(async (idStr) => {
-          try {
-            const id = BigInt(idStr);
-            const listing = await marketContract.listings(id);
-            const seller = listing[0];
-            const price = listing[1];
-
-            if (seller && seller !== ethers.ZeroAddress) {
-              let name = idToNameMap.get(idStr);
-              if (!name) {
-                try {
-                  const registrarContract = new ethers.Contract(REGISTRAR_ADDRESS, ["function labels(uint256) view returns (string)"], provider);
-                  name = await registrarContract.labels(id);
-                } catch {
-                  name = '';
-                }
-              }
-
-              if (!name) {
-                name = `Token #${idStr.slice(0, 6)}`;
-              }
-
-              marketResults.push({
-                name,
-                id: idStr,
-                price: ethers.formatEther(price),
-                seller,
-                isUSDCListing: false
-              });
-            }
-          } catch (err) {}
-        }));
-      } catch (marketErr) {}
-
-      if (isConnected && address) {
+      for (const idStr of Array.from(ownedTokenIds)) {
         try {
-          const ownedDomainsData: typeof userDomains = [];
-          const registrarContract = new ethers.Contract(REGISTRAR_ADDRESS, [
-            "function tokenURI(uint256) view returns (string)",
-            "function ownerOf(uint256) view returns (address)",
-            "function nameExpires(uint256) view returns (uint256)"
-          ], provider);
+          const id = BigInt(idStr);
 
-          for (const name of trackedNames) {
-            try {
-              const id = labelToId(name);
-              const idBigInt = BigInt(id);
-              
-              const currentOwner = await registrarContract.ownerOf(idBigInt).catch(() => ethers.ZeroAddress);
-              
-              if (currentOwner.toLowerCase() === address.toLowerCase()) {
-                const tokenURI = await registrarContract.tokenURI(idBigInt).catch(() => '');
-                
-                let svgUrl = '';
-                try {
-                  if (tokenURI && tokenURI.startsWith('data:application/json;base64,')) {
-                    const jsonB64 = tokenURI.substring('data:application/json;base64,'.length);
-                    const jsonStr = atob(jsonB64);
-                    const parsed = JSON.parse(jsonStr);
-                    svgUrl = parsed.image;
-                  }
-                } catch (e) {}
+          const currentOwner = await registrarContract.ownerOf(id).catch(() => ethers.ZeroAddress);
+          if (currentOwner.toLowerCase() !== address.toLowerCase()) continue; // no longer owned
 
-                if (!svgUrl) {
-                  const svg = generateLocalSVG(name);
-                  svgUrl = `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
-                }
+          const label = await registrarContract.labels(id).catch(() => '');
+          const name = label || idToNameMap.get(idStr) || `Token #${idStr.slice(0, 6)}`;
 
-                let expiry = Math.floor(Date.now() / 1000) + 31536000;
-                try {
-                  const exp = await registrarContract.nameExpires(idBigInt);
-                  expiry = Number(exp);
-                } catch {}
-
-                let resolvedAddress = ethers.ZeroAddress;
-                try {
-                  const node = namehash(`${name}.arc`);
-                  const resolverContract = new ethers.Contract(RESOLVER_ADDRESS, RESOLVER_ABI, provider);
-                  resolvedAddress = await resolverContract.addr(node);
-                } catch {}
-
-                ownedDomainsData.push({
-                  id: id,
-                  name: name,
-                  owner: currentOwner,
-                  expiry: expiry,
-                  svgUrl: svgUrl,
-                  resolvedAddress: resolvedAddress
-                });
-              }
-            } catch (err) {}
+          const tokenURI = await registrarContract.tokenURI(id).catch(() => '');
+          let svgUrl = '';
+          try {
+            if (tokenURI && tokenURI.startsWith('data:application/json;base64,')) {
+              const jsonB64 = tokenURI.substring('data:application/json;base64,'.length);
+              const parsed = JSON.parse(atob(jsonB64));
+              svgUrl = parsed.image;
+            }
+          } catch (e) {
+            console.warn('Failed to parse tokenURI, fallback to local rendering', e);
           }
-          listResults.push(...ownedDomainsData);
-        } catch (err) {}
+          if (!svgUrl) {
+            const svg = generateLocalSVG(name);
+            svgUrl = `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+          }
+
+          let expiry = Math.floor(Date.now() / 1000) + 31536000;
+          try {
+            expiry = Number(await registrarContract.nameExpires(id));
+          } catch { /* keep default */ }
+
+          let resolvedAddress = ethers.ZeroAddress;
+          if (name && !name.startsWith('Token #')) {
+            try {
+              const node = namehash(`${name}.arc`);
+              const resolverContract = new ethers.Contract(RESOLVER_ADDRESS, RESOLVER_ABI, provider);
+              resolvedAddress = await resolverContract.addr(node);
+            } catch { /* keep default */ }
+          }
+
+          listResults.push({ id: idStr, name, owner: currentOwner, expiry, svgUrl, resolvedAddress });
+        } catch (err) {
+          console.warn(`Failed to fetch metadata for token ${idStr}:`, err);
+        }
+      }
+    }
+
+    setUserDomains(listResults);
+    setMarketplaceListings(marketResults);
+
+    if (warnings.length > 0) {
+      setDataSourceWarning(
+        `Live indexer unavailable — showing a direct chain scan, and it couldn't fully load: ${warnings.join(', ')}. Numbers here may be incomplete; try refreshing.`
+      );
+    } else {
+      setDataSourceWarning('Live indexer unavailable — showing a direct chain scan (this can be slower on a public RPC).');
+    }
+  };
+
+  // --- Fetch Marketplace and User Domains: indexer-first, chain-scan fallback ---
+  const fetchDomainsAndListings = async () => {
+    setIsLoadingDomains(true);
+    try {
+      const [statsResult, domainsResult, marketResult] = await Promise.allSettled([
+        fetchIndexerStats(),
+        isConnected && address ? fetchIndexerDomains(address) : Promise.resolve([]),
+        fetchIndexerMarketplace()
+      ]);
+
+      const indexerAvailable =
+        statsResult.status === 'fulfilled' &&
+        domainsResult.status === 'fulfilled' &&
+        marketResult.status === 'fulfilled';
+
+      if (!indexerAvailable) {
+        const reasons = [
+          ['stats', statsResult],
+          ['domains', domainsResult],
+          ['marketplace', marketResult]
+        ]
+          .filter(([, r]) => (r as PromiseSettledResult<unknown>).status === 'rejected')
+          .map(([label, r]) => {
+            const reason = (r as PromiseRejectedResult).reason;
+            const message = reason instanceof Error ? reason.message : String(reason);
+            return `${label}: ${message}`;
+          });
+
+        console.warn('[ARC] indexer API unreachable, falling back to direct chain scan:', reasons);
+        setIndexerErrorDetail(reasons.join(' — '));
+        await fetchDomainsAndListingsFromChain();
+        return;
       }
 
-      setUserDomains(listResults);
-      setMarketplaceListings(marketResults);
+      setIndexerErrorDetail(null);
+
+      setDataSourceWarning(null);
+
+      // --- stats ---
+      const stats = statsResult.value;
+      setStatsRevenue(
+        parseFloat(ethers.formatEther(stats.totalRevenueWei)).toLocaleString(undefined, {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2
+        })
+      );
+      setStatsNamesCount(stats.namesClaimed.toLocaleString());
+
+      // --- marketplace ---
+      setMarketplaceListings(
+        marketResult.value.map((l) => ({
+          name: l.name ?? `Token #${l.token_id.slice(0, 6)}`,
+          id: l.token_id,
+          price: ethers.formatEther(l.price_wei),
+          seller: l.seller,
+          isUSDCListing: false
+        }))
+      );
+
+      // --- user domains: indexer gives us name/owner/expiry, but the SVG
+      // image / live resolver record are cheap enough to fetch per-token
+      // directly (bounded by how many domains this one user owns, not the
+      // whole collection's history) ---
+      if (isConnected && address) {
+        const provider = new ethers.JsonRpcProvider('https://rpc.testnet.arc.network');
+        const registrarContract = new ethers.Contract(REGISTRAR_ADDRESS, [
+          'function tokenURI(uint256) view returns (string)'
+        ], provider);
+        const resolverContract = new ethers.Contract(RESOLVER_ADDRESS, RESOLVER_ABI, provider);
+
+        const enriched = await Promise.all(domainsResult.value.map(async (d) => {
+          let svgUrl = '';
+          try {
+            const tokenURI = await registrarContract.tokenURI(BigInt(d.token_id));
+            if (tokenURI && tokenURI.startsWith('data:application/json;base64,')) {
+              const jsonB64 = tokenURI.substring('data:application/json;base64,'.length);
+              const parsed = JSON.parse(atob(jsonB64));
+              svgUrl = parsed.image;
+            }
+          } catch (e) {
+            console.warn(`Could not load tokenURI for ${d.name}.arc, using local render:`, e);
+          }
+          if (!svgUrl) {
+            svgUrl = `data:image/svg+xml;utf8,${encodeURIComponent(generateLocalSVG(d.name))}`;
+          }
+
+          let resolvedAddress = ethers.ZeroAddress;
+          try {
+            resolvedAddress = await resolverContract.addr(namehash(`${d.name}.arc`));
+          } catch { /* keep default */ }
+
+          return {
+            id: d.token_id,
+            name: d.name,
+            owner: d.owner,
+            expiry: d.expires_at,
+            svgUrl,
+            resolvedAddress
+          };
+        }));
+
+        setUserDomains(enriched);
+      } else {
+        setUserDomains([]);
+      }
     } catch (err) {
-      console.warn('Failed to load on-chain domains/listings, using fallback cache:', err);
+      console.error('[ARC] fetchDomainsAndListings failed entirely, falling back to chain scan:', err);
+      try {
+        await fetchDomainsAndListingsFromChain();
+      } catch (fallbackErr) {
+        console.error('[ARC][scan-failure] chain-scan fallback also failed:', fallbackErr);
+        setDataSourceWarning('Could not load domain/marketplace data from either the indexer or the chain. Please try refreshing.');
+      }
     } finally {
       setIsLoadingDomains(false);
     }
   };
 
+  // Refetch when tab changes or tracked domains update
   useEffect(() => {
     fetchDomainsAndListings();
   }, [activeTab, trackedNames, isConnected, address]);
 
+  // --- Edit Records ---
   const openRecordManager = async (name: string) => {
     setSelectedDomain(name);
     setRecordAddr('');
@@ -811,7 +1066,9 @@ export default function App() {
       setRecordAddr(currentAddr && currentAddr !== ethers.ZeroAddress ? currentAddr : '');
       setRecordTwitter(twitter || '');
       setRecordDesc(description || '');
-    } catch (err) {}
+    } catch (err) {
+      console.warn('Could not read existing record data, proceeding empty.');
+    }
   };
 
   const updateRecords = async () => {
@@ -819,12 +1076,12 @@ export default function App() {
     setIsUpdatingRecord(true);
 
     try {
+      await ensureCorrectChain();
+
       const node = namehash(`${selectedDomain}.arc`);
       const provider = new ethers.JsonRpcProvider('https://rpc.testnet.arc.network');
-      const registry = new ethers.Contract(REGISTRY_ADDRESS, [
-        'function owner(bytes32 node) view returns (address)'
-      ], provider);
-      
+      const registry = new ethers.Contract(REGISTRY_ADDRESS, ['function owner(bytes32 node) view returns (address)'], provider);
+
       const nodeOwner = await registry.owner(node).catch(() => ethers.ZeroAddress);
       if (nodeOwner.toLowerCase() !== address.toLowerCase()) {
         showError('You must be the owner of the node in the Registry to update its resolver records.');
@@ -834,36 +1091,38 @@ export default function App() {
 
       if (recordAddr) {
         showSuccess('Please approve the address configuration transaction...');
-        await writeContractAsync({
+        const addrTx = await writeContractAsync({
           address: RESOLVER_ADDRESS,
           abi: RESOLVER_ABI,
           functionName: 'setAddr',
-          args: [node, recordAddr],
-          gas: 100000n
+          args: [node as `0x${string}`, recordAddr as `0x${string}`]
         });
+        await waitForTx(addrTx);
       }
 
       if (recordDesc) {
         showSuccess('Please approve the profile description transaction...');
-        await writeContractAsync({
+        const descTx = await writeContractAsync({
           address: RESOLVER_ADDRESS,
           abi: RESOLVER_ABI,
           functionName: 'setText',
-          args: [node, 'description', recordDesc],
-          gas: 100000n
+          args: [node as `0x${string}`, 'description', recordDesc]
         });
+        await waitForTx(descTx);
       }
 
       showSuccess('Records successfully configured on-chain!');
       setIsManagingRecords(false);
       fetchDomainsAndListings();
     } catch (err: any) {
+      console.error(err);
       showError(parseRevertReason(err));
     } finally {
       setIsUpdatingRecord(false);
     }
   };
 
+  // --- Marketplace Actions ---
   const initiateListing = (name: string) => {
     setIsListingToken(name);
     setListingPrice('');
@@ -874,6 +1133,8 @@ export default function App() {
     setIsSubmittingListing(true);
 
     try {
+      await ensureCorrectChain();
+
       const id = labelToId(isListingToken);
       const priceWei = ethers.parseEther(listingPrice);
 
@@ -883,28 +1144,29 @@ export default function App() {
 
       if (approvedAddress.toLowerCase() !== MARKET_ADDRESS.toLowerCase()) {
         showSuccess('Please approve the marketplace listing permission first...');
-        await writeContractAsync({
+        const approveTx = await writeContractAsync({
           address: REGISTRAR_ADDRESS,
           abi: REGISTRAR_ABI,
           functionName: 'approve',
-          args: [MARKET_ADDRESS, id],
-          gas: 100000n
+          args: [MARKET_ADDRESS, BigInt(id)]
         });
+        await waitForTx(approveTx);
       }
 
       showSuccess('Please approve the secondary marketplace listing transaction...');
-      await writeContractAsync({
+      const listTx = await writeContractAsync({
         address: MARKET_ADDRESS,
         abi: MARKET_ABI,
         functionName: 'list',
-        args: [id, priceWei],
-        gas: 200000n
+        args: [BigInt(id), priceWei]
       });
+      await waitForTx(listTx);
 
       showSuccess(`Domain ${isListingToken}.arc listed for ${listingPrice} USDC!`);
       setIsListingToken(null);
       fetchDomainsAndListings();
     } catch (err: any) {
+      console.error(err);
       showError(parseRevertReason(err));
     } finally {
       setIsSubmittingListing(false);
@@ -913,42 +1175,50 @@ export default function App() {
 
   const cancelListing = async (name: string) => {
     try {
+      await ensureCorrectChain();
+
       const id = labelToId(name);
       showSuccess('Please approve the listing cancellation transaction...');
-      await writeContractAsync({
+      const unlistTx = await writeContractAsync({
         address: MARKET_ADDRESS,
         abi: MARKET_ABI,
         functionName: 'unlist',
-        args: [id],
-        gas: 100000n
+        args: [BigInt(id)]
       });
+      await waitForTx(unlistTx);
       showSuccess(`Domain ${name}.arc has been successfully unlisted.`);
       fetchDomainsAndListings();
     } catch (err: any) {
+      console.error(err);
       showError(parseRevertReason(err));
     }
   };
 
   const purchaseListing = async (listing: typeof marketplaceListings[0]) => {
     try {
+      await ensureCorrectChain();
+
       const priceWei = ethers.parseEther(listing.price);
       showSuccess(`Purchasing ${listing.name}.arc for ${listing.price} USDC...`);
-      await writeContractAsync({
+      const buyTx = await writeContractAsync({
         address: MARKET_ADDRESS,
         abi: MARKET_ABI,
         functionName: 'buy',
-        args: [listing.id, priceWei],
-        value: priceWei,
-        gas: 300000n
+        args: [BigInt(listing.id), priceWei],
+        value: priceWei // Paid in native USDC (18 decimals)
       });
+      showSuccess('Confirming purchase on-chain...');
+      await waitForTx(buyTx);
       confetti({ particleCount: 150, spread: 80 });
       showSuccess(`Congratulations! You are the new owner of ${listing.name}.arc.`);
       fetchDomainsAndListings();
     } catch (err: any) {
+      console.error(err);
       showError(parseRevertReason(err));
     }
   };
 
+  // Local SVG generator matching on-chain SVG precisely
   const generateLocalSVG = (name: string) => {
     return `<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1000" viewBox="0 0 1000 1000" font-family="'Helvetica Neue',Arial,sans-serif">
   <defs>
@@ -977,6 +1247,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#070B08] text-[#EAF6EC] font-sans antialiased overflow-x-hidden selection:bg-[#7DFF66] selection:text-[#070B08]">
+      {/* Background radial effects */}
       <div className="absolute top-0 left-1/4 w-[500px] h-[500px] bg-[#7DFF66]/5 rounded-full blur-[140px] pointer-events-none" />
       <div className="absolute bottom-20 right-10 w-[400px] h-[400px] bg-[#7DFF66]/3 rounded-full blur-[120px] pointer-events-none" />
 
@@ -994,6 +1265,7 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-4">
+            {/* Wallet Button */}
             {isConnected && address ? (
               <div className="flex items-center gap-2">
                 <div className="hidden sm:flex flex-col items-end font-mono text-[11px] text-[#7E9384]">
@@ -1002,7 +1274,7 @@ export default function App() {
                 <div className="flex items-center gap-2 bg-[#7DFF66]/10 border border-[#7DFF66]/30 px-3 py-1.5 rounded-lg">
                   <span className="w-2 h-2 rounded-full bg-[#7DFF66]" />
                   <span className="text-xs font-mono font-bold text-[#EAF6EC]">
-                    {primaryName ? primaryName : `${address.slice(0, 6)}...${address.slice(-4)}`}
+                    {address.slice(0, 6)}...{address.slice(-4)}
                   </span>
                   <button onClick={() => disconnect()} className="text-[#7E9384] hover:text-red-400 text-xs ml-1 font-semibold uppercase">
                     Exit
@@ -1010,7 +1282,7 @@ export default function App() {
                 </div>
               </div>
             ) : (
-              <button 
+              <button
                 onClick={() => connect({ connector: injected() })}
                 className="relative group overflow-hidden border border-[#7DFF66] text-[#7DFF66] font-mono font-bold text-xs uppercase px-5 py-2.5 rounded-md transition-all duration-300 hover:bg-[#7DFF66] hover:text-[#070B08] shadow-[0_0_15px_rgba(125,255,102,0.15)]"
               >
@@ -1018,7 +1290,8 @@ export default function App() {
               </button>
             )}
 
-            <button 
+            {/* Hamburger */}
+            <button
               onClick={() => setIsMenuOpen(true)}
               className="p-2 text-[#7E9384] hover:text-[#EAF6EC] transition-colors"
             >
@@ -1028,10 +1301,27 @@ export default function App() {
         </div>
       </header>
 
+      {/* --- Data source warning banner --- */}
+      {dataSourceWarning && (
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-4">
+          <div className="flex items-start gap-3 bg-amber-400/5 border border-amber-400/20 rounded-xl p-3.5 text-xs font-mono text-amber-400">
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+            <div className="space-y-1 min-w-0">
+              <span>{dataSourceWarning}</span>
+              {indexerErrorDetail && (
+                <div className="text-[10px] text-amber-400/70 break-all">
+                  Debug: {indexerErrorDetail}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* --- Hamburger Full-Screen Slideout --- */}
       <AnimatePresence>
         {isMenuOpen && (
-          <motion.div 
+          <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
@@ -1084,8 +1374,9 @@ export default function App() {
         {/* TAB 1: Search & Stepper */}
         {activeTab === 'search' && (
           <section className="space-y-12">
+            {/* Hero Titles */}
             <div className="text-center max-w-3xl mx-auto space-y-4">
-              <motion.h1 
+              <motion.h1
                 initial={{ opacity: 0, y: 15 }}
                 animate={{ opacity: 1, y: 0 }}
                 className="text-4xl sm:text-6xl font-black tracking-tight"
@@ -1097,10 +1388,11 @@ export default function App() {
               </p>
             </div>
 
+            {/* Glowing Search Box */}
             <div className="max-w-2xl mx-auto">
               <form onSubmit={handleSearchOnChain} className="relative flex items-center group">
-                <input 
-                  type="text" 
+                <input
+                  type="text"
                   placeholder="Search your .arc name"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
@@ -1109,7 +1401,7 @@ export default function App() {
                 <div className="absolute right-20 font-mono font-bold text-[#7E9384] text-lg select-none pointer-events-none mr-2">
                   .arc
                 </div>
-                <button 
+                <button
                   type="submit"
                   disabled={isSearching}
                   className="absolute right-3 p-3.5 bg-[#7DFF66] hover:bg-[#8aff75] text-[#070B08] rounded-lg transition-all"
@@ -1118,10 +1410,11 @@ export default function App() {
                 </button>
               </form>
 
+              {/* Quick-tag pills */}
               <div className="flex flex-wrap gap-2.5 justify-center mt-4 text-xs font-mono text-[#7E9384]">
                 <span>Try searching:</span>
                 {['btc', 'sol', 'usdc', 'degen', 'prime'].map((tag) => (
-                  <button 
+                  <button
                     key={tag}
                     onClick={() => {
                       setSearchQuery(tag);
@@ -1137,8 +1430,9 @@ export default function App() {
               </div>
             </div>
 
+            {/* Search Result display */}
             {searchResult && (
-              <motion.div 
+              <motion.div
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 className="max-w-2xl mx-auto bg-[#070B08]/40 border border-[#7E9384]/10 rounded-2xl p-6 backdrop-blur-sm space-y-6"
@@ -1167,7 +1461,8 @@ export default function App() {
 
                     <div className="border-t border-[#7E9384]/15 pt-6 space-y-4">
                       <h4 className="text-sm font-mono text-[#7E9384] uppercase tracking-wider font-bold">Claim Commit-Reveal Flow</h4>
-                      
+
+                      {/* Step Status Tracker */}
                       <div className="grid grid-cols-3 gap-2 text-center text-xs font-mono">
                         <div className={`p-3 rounded-lg border transition-all ${
                           !activeCommitment ? 'bg-[#7DFF66]/5 border-[#7DFF66]/30 text-[#7DFF66]' : 'bg-[#7E9384]/5 border-[#7E9384]/10 text-[#7E9384]'
@@ -1189,6 +1484,7 @@ export default function App() {
                         </div>
                       </div>
 
+                      {/* Control buttons */}
                       {!activeCommitment ? (
                         <button
                           onClick={triggerCommit}
@@ -1200,7 +1496,7 @@ export default function App() {
                       ) : activeCommitment.step === 'waiting' ? (
                         <div className="space-y-4">
                           <div className="relative w-full bg-[#7E9384]/10 h-3 rounded-full overflow-hidden">
-                            <motion.div 
+                            <motion.div
                               initial={{ width: '0%' }}
                               animate={{ width: `${((60 - countdown) / 60) * 100}%` }}
                               className="absolute top-0 bottom-0 left-0 bg-[#7DFF66]"
@@ -1209,12 +1505,6 @@ export default function App() {
                           <p className="text-xs text-[#7E9384] text-center font-mono animate-pulse">
                             Preventing front-running on-chain. Please wait 60 seconds...
                           </p>
-                          <button
-                            onClick={() => setActiveCommitment(prev => prev ? { ...prev, step: 'ready' } : null)}
-                            className="w-full border border-[#7E9384]/20 hover:border-[#7DFF66]/50 text-xs font-mono text-[#7E9384] py-2 rounded-lg"
-                          >
-                            Skip waiting delay (Developer Mode)
-                          </button>
                         </div>
                       ) : activeCommitment.step === 'ready' ? (
                         <button
@@ -1249,13 +1539,13 @@ export default function App() {
                           </div>
                         </div>
                         <div className="flex gap-2">
-                          <button 
+                          <button
                             onClick={() => openRecordManager(searchResult.name)}
                             className="bg-white/5 hover:bg-white/10 text-white font-mono text-xs px-3 py-1.5 rounded-lg border border-white/10 font-bold uppercase transition-all"
                           >
                             MANAGE
                           </button>
-                          <button 
+                          <button
                             onClick={() => triggerRenew(searchResult.name)}
                             disabled={isRenewing === searchResult.name}
                             className="bg-[#7DFF66]/10 hover:bg-[#7DFF66]/20 text-[#7DFF66] border border-[#7DFF66]/30 font-mono text-xs px-3 py-1.5 rounded-lg font-bold uppercase transition-all flex items-center gap-1"
@@ -1274,7 +1564,7 @@ export default function App() {
                             <span className="text-xs text-[#7E9384]">Already registered by someone else</span>
                           </div>
                         </div>
-                        <button 
+                        <button
                           onClick={() => {
                             setActiveTab('marketplace');
                             setSearchQuery('');
@@ -1314,7 +1604,7 @@ export default function App() {
                 { title: 'SETTLES IN', value: '< 350ms', desc: 'Malachite finality', change: 'Deterministic' },
                 { title: 'GAS FEES', value: '< $0.01', desc: 'Denominated in USDC', change: 'Zero volatile exposure' }
               ].map((card, i) => (
-                <div 
+                <div
                   key={i}
                   className="bg-[#070B08]/40 border border-[#7E9384]/15 rounded-xl p-6 backdrop-blur-sm space-y-2 relative overflow-hidden group hover:border-[#7DFF66]/30 transition-all"
                 >
@@ -1339,7 +1629,7 @@ export default function App() {
                 <h2 className="text-3xl font-black tracking-tight">Your On-Chain <span className="text-[#7DFF66]">Identity</span></h2>
                 <p className="text-[#7E9384] text-sm font-mono mt-1">DECIMALS FORMAT: 18-DECIMAL NATIVE USDC</p>
               </div>
-              <button 
+              <button
                 onClick={fetchDomainsAndListings}
                 className="flex items-center gap-2 text-xs font-mono text-[#7E9384] hover:text-[#7DFF66] bg-white/5 border border-white/5 hover:border-[#7DFF66]/30 px-3 py-1.5 rounded-lg transition-all"
               >
@@ -1355,7 +1645,7 @@ export default function App() {
                 <p className="text-sm text-[#7E9384] font-mono">
                   Wallet is required to fetch registered domains and edit ENS primary records.
                 </p>
-                <button 
+                <button
                   onClick={() => connect({ connector: injected() })}
                   className="bg-[#7DFF66] text-[#070B08] font-bold font-mono text-xs px-6 py-3 rounded-lg uppercase"
                 >
@@ -1374,7 +1664,7 @@ export default function App() {
                 <p className="text-sm text-[#7E9384] font-mono">
                   Any name you register on Arc Testnet will show up here instantly.
                 </p>
-                <button 
+                <button
                   onClick={() => setActiveTab('search')}
                   className="bg-[#7DFF66] hover:bg-[#8aff75] text-[#070B08] font-bold font-mono text-xs px-6 py-3 rounded-lg uppercase"
                 >
@@ -1382,79 +1672,60 @@ export default function App() {
                 </button>
               </div>
             ) : (
-              <>
-                {/* Primary Name Banner for existing users */}
-                {primaryName === null && (
-                  <div className="bg-amber-400/10 border border-amber-400/30 p-4 rounded-xl mb-8 flex flex-col sm:flex-row justify-between items-center gap-4">
-                    <div className="flex items-center gap-3">
-                      <AlertCircle className="w-6 h-6 text-amber-400 shrink-0" />
-                      <div>
-                        <h4 className="font-bold text-white text-sm">Set your Primary Name</h4>
-                        <p className="text-amber-400/70 text-xs font-mono">You own .arc domains but haven't selected a primary identity.</p>
-                      </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+                {userDomains.map((dom) => (
+                  <div
+                    key={dom.id}
+                    className="bg-[#070B08] border border-[#7E9384]/15 rounded-2xl overflow-hidden group hover:border-[#7DFF66]/30 transition-all flex flex-col justify-between"
+                  >
+                    <div className="aspect-square bg-slate-950 flex items-center justify-center p-4 relative overflow-hidden">
+                      <img
+                        src={dom.svgUrl}
+                        alt={dom.name}
+                        className="w-full h-full object-contain rounded-xl group-hover:scale-[1.02] transition-transform duration-300"
+                      />
                     </div>
-                    <button 
-                      onClick={() => setPrimaryPromptName(userDomains[0].name)}
-                      className="bg-amber-400 hover:bg-amber-300 text-black font-mono text-xs px-4 py-2 rounded-lg font-bold uppercase whitespace-nowrap"
-                    >
-                      Choose Primary Name
-                    </button>
-                  </div>
-                )}
 
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
-                  {userDomains.map((dom) => (
-                    <div key={dom.id} className="bg-[#070B08] border border-[#7E9384]/15 rounded-2xl overflow-hidden group hover:border-[#7DFF66]/30 transition-all flex flex-col justify-between">
-                      <div className="aspect-square bg-slate-950 flex items-center justify-center p-4 relative overflow-hidden">
-                        <img src={dom.svgUrl} alt={dom.name} className="w-full h-full object-contain rounded-xl group-hover:scale-[1.02] transition-transform duration-300" />
-                      </div>
-
-                      <div className="p-6 space-y-4 bg-white/2">
-                        <div className="flex justify-between items-start">
-                          <div>
-                            <h3 className="text-xl font-bold font-mono text-white">{dom.name}.arc</h3>
-                            <span className="text-[10px] font-mono text-[#7E9384] block">TOKEN ID: {dom.id.slice(0, 10)}...</span>
-                            {dom.resolvedAddress && dom.resolvedAddress !== ethers.ZeroAddress && (
-                              <span className="text-[10px] font-mono text-[#7DFF66] block mt-1 truncate max-w-[200px]" title={dom.resolvedAddress}>
-                                RESOLVES TO: {dom.resolvedAddress.slice(0, 6)}...{dom.resolvedAddress.slice(-4)}
-                              </span>
-                            )}
-                          </div>
-                          <button onClick={() => handleCopy(`${dom.name}.arc`, dom.name)} className="p-2 bg-white/5 rounded-lg text-[#7E9384] hover:text-white">
-                            {copiedName === dom.name ? <Check className="w-4 h-4 text-[#7DFF66]" /> : <Copy className="w-4 h-4" />}
-                          </button>
-                        </div>
-
-                        <div className="flex flex-col gap-2">
-                          <div className="flex gap-2">
-                            <button onClick={() => openRecordManager(dom.name)} className="flex-1 bg-white/5 hover:bg-white/10 text-white font-mono text-xs py-2.5 rounded-lg border border-white/10 flex items-center justify-center gap-1.5 transition-all">
-                              <Settings className="w-4 h-4 text-[#7DFF66]" /> Edit Records
-                            </button>
-                            <button onClick={() => initiateListing(dom.name)} className="flex-1 bg-[#7DFF66]/10 hover:bg-[#7DFF66]/20 text-[#7DFF66] border border-[#7DFF66]/30 font-mono text-xs py-2.5 rounded-lg flex items-center justify-center gap-1.5 transition-all">
-                              <ShoppingBag className="w-4 h-4" /> List Market
-                            </button>
-                          </div>
-                          
-                          {primaryName === `${dom.name}.arc` ? (
-                            <div className="flex-1 bg-[#7DFF66]/10 text-[#7DFF66] border border-[#7DFF66]/30 font-mono text-xs py-2.5 rounded-lg flex items-center justify-center gap-1.5">
-                              <CheckCircle2 className="w-4 h-4" /> Primary Name
-                            </div>
-                          ) : (
-                            <button 
-                              onClick={() => handleSetPrimaryName(dom.name)} 
-                              disabled={isSettingPrimary === dom.name}
-                              className="flex-1 bg-white/5 hover:bg-white/10 text-[#7E9384] hover:text-white border border-white/10 font-mono text-xs py-2.5 rounded-lg flex items-center justify-center gap-1.5 transition-all"
-                            >
-                              {isSettingPrimary === dom.name ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Shield className="w-4 h-4" />}
-                              Set as Primary
-                            </button>
+                    <div className="p-6 space-y-4 bg-white/2">
+                      <div className="flex justify-between items-start">
+                        <div>
+                          <h3 className="text-xl font-bold font-mono text-white">{dom.name}.arc</h3>
+                          <span className="text-[10px] font-mono text-[#7E9384] block">TOKEN ID: {dom.id.slice(0, 10)}...</span>
+                          {dom.resolvedAddress && dom.resolvedAddress !== ethers.ZeroAddress && (
+                            <span className="text-[10px] font-mono text-[#7DFF66] block mt-1 truncate max-w-[200px]" title={dom.resolvedAddress}>
+                              RESOLVES TO: {dom.resolvedAddress.slice(0, 6)}...{dom.resolvedAddress.slice(-4)}
+                            </span>
                           )}
                         </div>
+                        <button
+                          onClick={() => handleCopy(`${dom.name}.arc`, dom.name)}
+                          className="p-2 bg-white/5 rounded-lg text-[#7E9384] hover:text-white"
+                        >
+                          {copiedName === dom.name ? <Check className="w-4 h-4 text-[#7DFF66]" /> : <Copy className="w-4 h-4" />}
+                        </button>
+                      </div>
+
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => openRecordManager(dom.name)}
+                          className="flex-1 bg-white/5 hover:bg-white/10 text-white font-mono text-xs py-2.5 rounded-lg border border-white/10 flex items-center justify-center gap-1.5 transition-all"
+                        >
+                          <Settings className="w-4 h-4 text-[#7DFF66]" />
+                          Edit Records
+                        </button>
+
+                        <button
+                          onClick={() => initiateListing(dom.name)}
+                          className="flex-1 bg-[#7DFF66]/10 hover:bg-[#7DFF66]/20 text-[#7DFF66] border border-[#7DFF66]/30 font-mono text-xs py-2.5 rounded-lg flex items-center justify-center gap-1.5 transition-all"
+                        >
+                          <ShoppingBag className="w-4 h-4" />
+                          List Market
+                        </button>
                       </div>
                     </div>
-                  ))}
-                </div>
-              </>
+                  </div>
+                ))}
+              </div>
             )}
           </section>
         )}
@@ -1500,14 +1771,14 @@ export default function App() {
                           </td>
                           <td className="p-5 text-right">
                             {address && address.toLowerCase() === listing.seller.toLowerCase() ? (
-                              <button 
+                              <button
                                 onClick={() => cancelListing(listing.name)}
                                 className="bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 px-4 py-2 rounded-lg text-xs font-bold uppercase transition-all"
                               >
                                 Cancel Listing
                               </button>
                             ) : (
-                              <button 
+                              <button
                                 onClick={() => purchaseListing(listing)}
                                 className="bg-[#7DFF66] hover:bg-[#8aff75] text-[#070B08] px-5 py-2 rounded-lg text-xs font-black uppercase transition-all"
                               >
@@ -1539,12 +1810,12 @@ export default function App() {
                 { char: '4 Characters', price: '$160', sub: 'Standard business & startup identifiers', gradient: 'from-white/5 to-white/0', border: 'border-white/10' },
                 { char: '5+ Characters', price: '$5', sub: 'Standard personal identity & developer profiles', gradient: 'from-white/5 to-white/0', border: 'border-white/10' }
               ].map((tier, idx) => (
-                <div 
+                <div
                   key={idx}
                   className={`bg-[#070B08] ${tier.border} rounded-2xl p-8 space-y-6 relative overflow-hidden group hover:border-[#7DFF66]/30 transition-all flex flex-col justify-between`}
                 >
                   <div className={`absolute inset-0 bg-gradient-to-b ${tier.gradient} opacity-50`} />
-                  
+
                   <div className="relative space-y-4">
                     <span className="text-[10px] font-mono tracking-widest text-[#7DFF66] font-bold uppercase">Tier 0{idx + 1}</span>
                     <h3 className="text-2xl font-bold font-mono text-white">{tier.char}</h3>
@@ -1556,7 +1827,7 @@ export default function App() {
                       <span className="text-4xl font-black text-white font-mono">{tier.price}</span>
                       <span className="text-[#7E9384] text-xs font-mono"> / yr</span>
                     </div>
-                    <button 
+                    <button
                       onClick={() => {
                         setActiveTab('search');
                         setSearchQuery('');
@@ -1570,6 +1841,7 @@ export default function App() {
               ))}
             </div>
 
+            {/* Network parameters table */}
             <div className="max-w-3xl mx-auto bg-[#070B08]/40 border border-[#7E9384]/15 rounded-2xl p-6 space-y-4 font-mono text-xs">
               <h4 className="text-sm font-bold text-white uppercase tracking-wider">Arc Network Deployment Parameters</h4>
               <div className="grid grid-cols-2 gap-4 text-[#7E9384]">
@@ -1622,6 +1894,7 @@ export default function App() {
 
       </main>
 
+      {/* --- Footer --- */}
       <footer className="border-t border-[#7E9384]/10 bg-[#070B08] py-8 text-center text-xs font-mono text-[#7E9384] max-w-7xl mx-auto px-4">
         <div className="flex flex-col sm:flex-row justify-between items-center gap-4">
           <p>&copy; 2026 .arc Name Service. All rights reserved.</p>
@@ -1641,13 +1914,13 @@ export default function App() {
       {/* --- Dialog: Record Manager --- */}
       <AnimatePresence>
         {isManagingRecords && selectedDomain && (
-          <motion.div 
+          <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
           >
-            <motion.div 
+            <motion.div
               initial={{ scale: 0.95, y: 15 }}
               animate={{ scale: 1, y: 0 }}
               exit={{ scale: 0.95, y: 15 }}
@@ -1666,8 +1939,8 @@ export default function App() {
               <div className="space-y-4">
                 <div className="space-y-1.5">
                   <label className="text-xs font-mono text-[#7E9384] font-bold block uppercase">Primary Address Record</label>
-                  <input 
-                    type="text" 
+                  <input
+                    type="text"
                     value={recordAddr}
                     onChange={(e) => setRecordAddr(e.target.value)}
                     placeholder="0x..."
@@ -1677,8 +1950,8 @@ export default function App() {
 
                 <div className="space-y-1.5">
                   <label className="text-xs font-mono text-[#7E9384] font-bold block uppercase">Twitter / X handle</label>
-                  <input 
-                    type="text" 
+                  <input
+                    type="text"
                     value={recordTwitter}
                     onChange={(e) => setRecordTwitter(e.target.value)}
                     placeholder="@username"
@@ -1688,8 +1961,8 @@ export default function App() {
 
                 <div className="space-y-1.5">
                   <label className="text-xs font-mono text-[#7E9384] font-bold block uppercase">Profile Description</label>
-                  <input 
-                    type="text" 
+                  <input
+                    type="text"
                     value={recordDesc}
                     onChange={(e) => setRecordDesc(e.target.value)}
                     placeholder="Proud owner of an .arc Web3 ID"
@@ -1699,13 +1972,13 @@ export default function App() {
               </div>
 
               <div className="flex gap-4">
-                <button 
+                <button
                   onClick={() => setIsManagingRecords(false)}
                   className="flex-1 border border-white/10 hover:bg-white/5 text-white font-mono text-xs py-3 rounded-lg uppercase"
                 >
                   Cancel
                 </button>
-                <button 
+                <button
                   onClick={updateRecords}
                   disabled={isUpdatingRecord}
                   className="flex-1 bg-[#7DFF66] hover:bg-[#8aff75] text-[#070B08] font-bold font-mono text-xs py-3 rounded-lg uppercase flex items-center justify-center gap-1.5"
@@ -1722,13 +1995,13 @@ export default function App() {
       {/* --- Dialog: Market Listing Manager --- */}
       <AnimatePresence>
         {isListingToken && (
-          <motion.div 
+          <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
           >
-            <motion.div 
+            <motion.div
               initial={{ scale: 0.95, y: 15 }}
               animate={{ scale: 1, y: 0 }}
               exit={{ scale: 0.95, y: 15 }}
@@ -1748,8 +2021,8 @@ export default function App() {
                 <div className="space-y-1.5">
                   <label className="text-xs font-mono text-[#7E9384] font-bold block uppercase">Asking Price (USDC)</label>
                   <div className="relative flex items-center">
-                    <input 
-                      type="number" 
+                    <input
+                      type="number"
                       value={listingPrice}
                       onChange={(e) => setListingPrice(e.target.value)}
                       placeholder="e.g. 50"
@@ -1761,13 +2034,13 @@ export default function App() {
               </div>
 
               <div className="flex gap-4">
-                <button 
+                <button
                   onClick={() => setIsListingToken(null)}
                   className="flex-1 border border-white/10 hover:bg-white/5 text-white font-mono text-xs py-3 rounded-lg uppercase"
                 >
                   Cancel
                 </button>
-                <button 
+                <button
                   onClick={submitListing}
                   disabled={isSubmittingListing || !listingPrice}
                   className="flex-1 bg-[#7DFF66] hover:bg-[#8aff75] text-[#070B08] font-bold font-mono text-xs py-3 rounded-lg uppercase flex items-center justify-center gap-1.5"
@@ -1781,56 +2054,10 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      {/* --- Dialog: Primary Name Prompt --- */}
-      <AnimatePresence>
-        {primaryPromptName && (
-          <motion.div 
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
-          >
-            <motion.div 
-              initial={{ scale: 0.95, y: 15 }}
-              animate={{ scale: 1, y: 0 }}
-              exit={{ scale: 0.95, y: 15 }}
-              className="bg-[#070B08] border border-[#7E9384]/20 rounded-2xl max-w-md w-full p-6 space-y-6 text-center"
-            >
-              <div className="w-16 h-16 bg-[#7DFF66]/10 rounded-full flex items-center justify-center mx-auto">
-                <Shield className="w-8 h-8 text-[#7DFF66]" />
-              </div>
-              <div>
-                <h3 className="text-xl font-bold font-mono mb-2">Set Primary Name?</h3>
-                <p className="text-[#7E9384] text-sm font-mono">
-                  Set <span className="text-[#7DFF66] font-bold">{primaryPromptName}.arc</span> as your primary identity so supported wallets and apps display your name instead of your address.
-                </p>
-              </div>
-
-              <div className="flex gap-4">
-                <button 
-                  onClick={() => setPrimaryPromptName(null)}
-                  className="flex-1 border border-white/10 hover:bg-white/5 text-white font-mono text-xs py-3 rounded-lg uppercase"
-                >
-                  Later
-                </button>
-                <button 
-                  onClick={() => handleSetPrimaryName(primaryPromptName)}
-                  disabled={isSettingPrimary === primaryPromptName}
-                  className="flex-1 bg-[#7DFF66] hover:bg-[#8aff75] text-[#070B08] font-bold font-mono text-xs py-3 rounded-lg uppercase flex items-center justify-center gap-1.5"
-                >
-                  {isSettingPrimary === primaryPromptName ? <RefreshCw className="w-4 h-4 animate-spin" /> : null}
-                  Set as Primary
-                </button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
       {/* Toasts */}
       <AnimatePresence>
         {successToast && (
-          <motion.div 
+          <motion.div
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: 20 }}
@@ -1842,7 +2069,7 @@ export default function App() {
         )}
 
         {errorToast && (
-          <motion.div 
+          <motion.div
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: 20 }}
@@ -1856,3 +2083,4 @@ export default function App() {
     </div>
   );
 }
+
