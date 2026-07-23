@@ -12,7 +12,7 @@ export const arcTestnet = {
   nativeCurrency: { decimals: 18, name: 'USDC', symbol: 'USDC' },
   rpcUrls: {
     default: {
-      http: ['https://rpc.testnet.arc.network'],
+      http: ['https://rpc.testnet.arc.io'],
     },
   },
   blockExplorers: {
