@@ -25,7 +25,7 @@ const RESOLVER_ADDRESS = '0x027d6dCc8F1235dfdd47E532e77909363C701E54';
 const MARKET_ADDRESS = '0xC94Ff1964840BdF8E6952455a2342Ffc6B0bA299';
 const REGISTRY_ADDRESS = '0xCA78696791670CbC14eE802e6DcDfD661a458978';
 const UNIVERSAL_RESOLVER_ADDRESS = '0xA3F364a558eb712AFbB4929df49e538A800438BC';
-const REVERSE_REGISTRAR_ADDRESS = '0x_REVERSE_REGISTRAR_ADDRESS'; // TODO: Replace with actual deployed ReverseRegistrar address
+const REVERSE_REGISTRAR_ADDRESS = '0x97cdcf037c1A8475eF5C9504A18C10b41f7DfDfB'; // address
 
 // Block from which we start indexing on-chain events (contract deployment block).
 // Only used by the client-side fallback scan below — the indexer keeps its
