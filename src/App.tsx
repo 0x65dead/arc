@@ -498,6 +498,17 @@ export default function App() {
     setTimeout(() => setCopiedName(null), 1500);
   };
 
+  // A commitment is only meaningful for the flow UI if it belongs to the
+  // name currently on screen. Without this, a commitment left over from a
+  // different name — restored from localStorage after a refresh/revisit, or
+  // simply because the user searched a new name while one was in flight —
+  // would make a brand-new search jump straight to whatever step the old
+  // commitment was left in (e.g. "ready"), skipping Commit + Wait entirely
+  // for a name that was never actually committed in this flow.
+  const relevantCommitment = (activeCommitment && searchResult && activeCommitment.name === searchResult.name)
+    ? activeCommitment
+    : null;
+
   // Keep commitment state synchronized
   useEffect(() => {
     if (activeCommitment) {
@@ -1359,7 +1370,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-white text-[#0A0A0A] font-['Inter'] antialiased overflow-x-hidden selection:bg-[#0A0A0A] selection:text-[#0A0A0A]">
+    <div className="min-h-screen bg-white text-[#0A0A0A] font-['Inter'] antialiased overflow-x-hidden selection:bg-[#0A0A0A] selection:text-white">
       {/* Background radial effects */}
       {/* Background radial effects — intentionally removed for the flat, editorial arc.io-style page */}
 
@@ -1577,19 +1588,19 @@ export default function App() {
                       {/* Step Status Tracker */}
                       <div className="grid grid-cols-3 gap-2 text-center text-xs font-mono">
                         <div className={`p-3 rounded-lg border transition-all ${
-                          !activeCommitment ? 'bg-[#F2A93B]/10 border-[#F2A93B]/40 text-[#F2A93B]' : 'bg-black/[0.03] border-black/10 text-[#6B6B6B]'
+                          !relevantCommitment ? 'bg-[#F2A93B]/10 border-[#F2A93B]/40 text-[#F2A93B]' : 'bg-black/[0.03] border-black/10 text-[#6B6B6B]'
                         }`}>
                           <div className="font-black text-base mb-1">01</div>
                           <span>Commit Name</span>
                         </div>
                         <div className={`p-3 rounded-lg border transition-all ${
-                          activeCommitment && activeCommitment.step === 'waiting' ? 'bg-[#F2A93B]/10 border-[#F2A93B]/40 text-[#F2A93B]' : 'bg-black/[0.03] border-black/10 text-[#6B6B6B]'
+                          relevantCommitment && relevantCommitment.step === 'waiting' ? 'bg-[#F2A93B]/10 border-[#F2A93B]/40 text-[#F2A93B]' : 'bg-black/[0.03] border-black/10 text-[#6B6B6B]'
                         }`}>
                           <div className="font-black text-base mb-1">02</div>
                           <span>Wait {countdown > 0 ? `(${countdown}s)` : 'Timer'}</span>
                         </div>
                         <div className={`p-3 rounded-lg border transition-all ${
-                          activeCommitment && (activeCommitment.step === 'ready' || activeCommitment.step === 'registering') ? 'bg-[#F2A93B]/10 border-[#F2A93B]/40 text-[#F2A93B]' : 'bg-black/[0.03] border-black/10 text-[#6B6B6B]'
+                          relevantCommitment && (relevantCommitment.step === 'ready' || relevantCommitment.step === 'registering') ? 'bg-[#F2A93B]/10 border-[#F2A93B]/40 text-[#F2A93B]' : 'bg-black/[0.03] border-black/10 text-[#6B6B6B]'
                         }`}>
                           <div className="font-black text-base mb-1">03</div>
                           <span>Reveal & Mint</span>
@@ -1597,7 +1608,7 @@ export default function App() {
                       </div>
 
                       {/* Control buttons */}
-                      {!activeCommitment ? (
+                      {!relevantCommitment ? (
                         <button
                           onClick={triggerCommit}
                           className="w-full bg-[#0A0A0A] hover:bg-[#1a1a1a] text-white font-bold font-mono py-4 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2 text-sm uppercase"
@@ -1605,7 +1616,7 @@ export default function App() {
                           <Clock className="w-5 h-5" />
                           Step 1: Commit Registry Reservation
                         </button>
-                      ) : activeCommitment.step === 'waiting' ? (
+                      ) : relevantCommitment.step === 'waiting' ? (
                         <div className="space-y-4">
                           <div className="relative w-full bg-black/5 h-3 rounded-full overflow-hidden">
                             <motion.div
@@ -1618,7 +1629,7 @@ export default function App() {
                             Preventing front-running on-chain. Please wait 60 seconds...
                           </p>
                         </div>
-                      ) : activeCommitment.step === 'ready' ? (
+                      ) : relevantCommitment.step === 'ready' ? (
                         <button
                           onClick={triggerRegister}
                           className="w-full bg-[#0A0A0A] hover:bg-[#1a1a1a] text-white font-bold font-mono py-4 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2 text-sm uppercase"
@@ -1626,7 +1637,7 @@ export default function App() {
                           <Sparkles className="w-5 h-5" />
                           Step 3: Reveal and Claim Domain
                         </button>
-                      ) : activeCommitment.step === 'registering' ? (
+                      ) : relevantCommitment.step === 'registering' ? (
                         <div className="flex items-center justify-center gap-3 p-4 bg-[#F2A93B]/10 border border-[#F2A93B]/30 rounded-xl text-center">
                           <RefreshCw className="w-5 h-5 animate-spin text-[#F2A93B]" />
                           <span className="font-mono text-sm text-[#F2A93B]">Processing registration on-chain...</span>
@@ -2164,61 +2175,4 @@ export default function App() {
                       type="number"
                       value={listingPrice}
                       onChange={(e) => setListingPrice(e.target.value)}
-                      placeholder="e.g. 50"
-                      className="w-full bg-black/[0.03] border border-black/10 rounded-lg p-2.5 font-mono text-sm outline-none focus:border-[#0A0A0A] pr-16"
-                    />
-                    <span className="absolute right-3 font-mono text-[#6B6B6B] text-xs">USDC</span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="flex gap-4">
-                <button
-                  onClick={() => setIsListingToken(null)}
-                  className="flex-1 border border-black/10 hover:bg-black/[0.03] text-[#0A0A0A] font-mono text-xs py-3 rounded-lg uppercase"
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={submitListing}
-                  disabled={isSubmittingListing || !listingPrice}
-                  className="flex-1 bg-[#0A0A0A] hover:bg-[#1a1a1a] text-white font-bold font-mono text-xs py-3 rounded-lg uppercase flex items-center justify-center gap-1.5"
-                >
-                  {isSubmittingListing ? <RefreshCw className="w-4 h-4 animate-spin" /> : null}
-                  Confirm List
-                </button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* Toasts */}
-      <AnimatePresence>
-        {successToast && (
-          <motion.div
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 20 }}
-            className="fixed bottom-6 right-6 z-50 bg-[#F2A93B]/10 border border-[#F2A93B]/40 px-5 py-3 rounded-xl flex items-center gap-3 shadow-md text-[#F2A93B] font-mono text-xs"
-          >
-            <CheckCircle2 className="w-5 h-5" />
-            <span>{successToast}</span>
-          </motion.div>
-        )}
-
-        {errorToast && (
-          <motion.div
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 20 }}
-            className="fixed bottom-6 right-6 z-50 bg-red-500/10 border border-red-500/30 px-5 py-3 rounded-xl flex items-center gap-3 shadow-[0_4px_30px_rgba(239,68,68,0.1)] text-red-400 font-mono text-xs"
-          >
-            <AlertCircle className="w-5 h-5 text-red-400" />
-            <span>{errorToast}</span>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </div>
-  );
-}
+        
