@@ -1,39 +1,36 @@
 import { useCallback } from 'react';
 import { useAccount, useSwitchChain } from 'wagmi';
-
-export const ARC_CHAIN_ID = 5042002;
-
-export class WrongChainError extends Error {
-  constructor(public currentChainId: number | undefined) {
-    super('Wallet is not on Arc Testnet');
-  }
-}
+import { ARC_CHAIN_ID } from '../config/chain';
+import { WrongChainError } from '../lib/errors';
 
 /**
- * Returns ensureCorrectChain(), which every write flow in App.tsx calls as
- * its very first line. If the wallet is already on Arc Testnet this is a
- * no-op; otherwise it asks the wallet to switch and only proceeds if that
- * succeeds. This is the fix for the "Confirm Send — Network: Ethereum"
- * screenshots: previously nothing checked the active chain before
- * writeContractAsync fired, so a signature could be requested (and signed)
- * on whatever network the wallet happened to have active.
+ * Guarantees the wallet is on Arc Testnet before a write is signed.
+ *
+ * Without this, `writeContract` signs against whatever network the wallet
+ * currently has selected — producing a "Confirm — Network: Ethereum" prompt
+ * for an Arc transaction. Every write path calls `ensureCorrectChain()` first.
+ *
+ * `switchChainAsync` only works if Arc Testnet is declared in the wagmi
+ * config's `chains` array; it is (see `src/config/wagmi.ts`), and both are
+ * built from the same `arcTestnet` definition so they cannot drift.
  */
 export function useChainGuard() {
-  const { chain } = useAccount();
+  const { chainId } = useAccount();
   const { switchChainAsync } = useSwitchChain();
 
-  const ensureCorrectChain = useCallback(async () => {
-    if (chain?.id === ARC_CHAIN_ID) return;
+  const isOnCorrectChain = chainId === ARC_CHAIN_ID;
 
+  const ensureCorrectChain = useCallback(async () => {
+    if (chainId === ARC_CHAIN_ID) return;
     try {
       await switchChainAsync({ chainId: ARC_CHAIN_ID });
-    } catch (err) {
-      // Wallet refused or doesn't support programmatic switching (some
-      // mobile wallet browsers don't). Surface a clear, typed error instead
-      // of letting the caller's writeContractAsync fire on the wrong chain.
-      throw new WrongChainError(chain?.id);
+    } catch {
+      // The wallet refused, or doesn't support programmatic switching (common
+      // in mobile in-app browsers). Raise a typed error so callers can show
+      // one clear instruction instead of a decoded RPC failure.
+      throw new WrongChainError(chainId);
     }
-  }, [chain?.id, switchChainAsync]);
+  }, [chainId, switchChainAsync]);
 
-  return { ensureCorrectChain, isOnCorrectChain: chain?.id === ARC_CHAIN_ID };
+  return { ensureCorrectChain, isOnCorrectChain, chainId };
 }

@@ -5,3 +5,7 @@
 
 # Exception: .env.example files are meant to be committed as templates
 !**/.env.example
+
+# VitePress build artifacts
+docs/.vitepress/dist
+docs/.vitepress/cache

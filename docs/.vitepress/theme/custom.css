@@ -1,0 +1,33 @@
+/* Back-to-app link injected into the nav bar by theme/index.ts. */
+.back-to-app {
+  margin-left: 12px;
+  padding: 0 12px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--vp-c-text-2);
+  white-space: nowrap;
+  transition:
+    color 0.25s,
+    border-color 0.25s,
+    background-color 0.25s;
+}
+
+.back-to-app:hover {
+  color: var(--vp-c-brand-1);
+  border-color: var(--vp-c-brand-1);
+  background-color: var(--vp-c-bg-soft);
+}
+
+/* The nav bar collapses into a hamburger below this width and the slot is
+   hidden with it, so the link would be unreachable on a phone. The docs
+   landing page carries its own raw link for that case. */
+@media (max-width: 767px) {
+  .back-to-app {
+    display: none;
+  }
+}

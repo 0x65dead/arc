@@ -1,42 +1,23 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import { WagmiProvider, createConfig, http } from 'wagmi';
-import { injected } from 'wagmi/connectors';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { WagmiProvider } from 'wagmi';
+import { QueryClientProvider } from '@tanstack/react-query';
 import App from './App';
+import { queryClient, wagmiConfig } from './config/wagmi';
+import { ToastProvider } from './hooks/useToasts';
 import './index.css';
 
-export const arcTestnet = {
-  id: 5042002,
-  name: 'Arc Testnet',
-  nativeCurrency: { decimals: 18, name: 'USDC', symbol: 'USDC' },
-  rpcUrls: {
-    default: {
-      http: ['https://rpc.testnet.arc.io'],
-    },
-  },
-  blockExplorers: {
-    default: { name: 'ArcScan', url: 'https://testnet.arcscan.app' },
-  },
-  testnet: true,
-} as const;
-
-const config = createConfig({
-  chains: [arcTestnet],
-  connectors: [injected()],
-  transports: {
-    [arcTestnet.id]: http(),
-  },
-});
-
-const queryClient = new QueryClient();
-
+// The chain and query client are defined in `config/wagmi.ts`, not here. This
+// file previously declared its own copy of the chain pointing at a different
+// RPC host from the one every read path used.
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <WagmiProvider config={config}>
+    <WagmiProvider config={wagmiConfig}>
       <QueryClientProvider client={queryClient}>
-        <App />
+        <ToastProvider>
+          <App />
+        </ToastProvider>
       </QueryClientProvider>
     </WagmiProvider>
-  </React.StrictMode>
+  </React.StrictMode>,
 );
