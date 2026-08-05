@@ -5,11 +5,11 @@
   "rewrites": [
     {
       "source": "/api/:path*",
-      "destination": "http://169.58.118.46:8787/api/:path*"
+      "destination": "https://vmi3483659.contaboserver.net/api/:path*"
     },
     {
       "source": "/health",
-      "destination": "http://169.58.118.46:8787/health"
+      "destination": "https://vmi3483659.contaboserver.net/health"
     }
   ],
   "headers": [
