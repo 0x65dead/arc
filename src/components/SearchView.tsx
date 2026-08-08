@@ -1,10 +1,12 @@
 import { useMemo, useState } from 'react';
 import { useAccount } from 'wagmi';
-import { AlertCircle, Check, Clock, Search as SearchIcon, X } from 'lucide-react';
+import { AlertCircle, ArrowUpRight, Check, Clock, Search as SearchIcon, X } from 'lucide-react';
 import { useNameSearch } from '../hooks/useNameSearch';
+import { useWaitlistConfig } from '../hooks/useWaitlist';
 import { describeError } from '../lib/errors';
 import { formatDate, formatNative, shortenAddress } from '../lib/format';
 import { fullName } from '../lib/names';
+import { waitlistSiteUrl } from '../lib/site';
 import { Badge, Button, Card, Input, Skeleton } from './ui';
 import { RegistrationPanel } from './RegistrationPanel';
 import { NameArtwork } from './NameArtwork';
@@ -13,6 +15,9 @@ export function SearchView() {
   const [query, setQuery] = useState('');
   const { label, result, isLoading, isStale, error, refetch } = useNameSearch(query);
   const { isConnected } = useAccount();
+  // Shared cache entry with the App shell's copy — same query key, so this is
+  // a read of what is already there rather than a second request.
+  const waitlistOpen = useWaitlistConfig().data?.enabled === true;
 
   return (
     <div className="mx-auto w-full max-w-3xl px-4 py-10 sm:py-16">
@@ -48,6 +53,22 @@ export function SearchView() {
           />
         </div>
       </form>
+
+      {/* Sits between the search box and the results, which is empty until the
+          first keystroke — so on the landing view this reads as part of the
+          hero, and once a search is under way it is above the fold but out of
+          the way. Hidden entirely when the waitlist is not configured. */}
+      {waitlistOpen ? (
+        <p className="mt-5 text-center text-sm text-ink-muted">
+          <a
+            href={waitlistSiteUrl()}
+            className="inline-flex items-center gap-1 text-accent hover:underline"
+          >
+            Mainnet is coming — join the waitlist
+            <ArrowUpRight className="size-3.5" aria-hidden />
+          </a>
+        </p>
+      ) : null}
 
       <div className="mt-6" aria-live="polite">
         {!label ? null : isLoading || isStale ? (

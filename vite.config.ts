@@ -152,7 +152,15 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     port: 3000,
-    allowedHosts: 'all',
+    /*
+     * `true`, not the string 'all' — Vite only skips its host check on the
+     * boolean, so 'all' silently blocked every non-localhost hostname with
+     * "Blocked request". That matters here because the two sites are told apart
+     * by hostname: without this you cannot reach `join.arc.local:3000` in
+     * development, and the waitlist shell is unreachable except via
+     * VITE_SITE_MODE.
+     */
+    allowedHosts: true,
     proxy: {
       ...indexerProxy,
       /*

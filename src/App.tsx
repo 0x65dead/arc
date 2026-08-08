@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Activity, BookOpen, Store, Search, Wallet } from 'lucide-react';
+import { Activity, BookOpen, MessageCircle, Sparkles, Store, Search, Wallet } from 'lucide-react';
 import { ConnectButton } from './components/ConnectButton';
 import { NetworkBanner } from './components/NetworkBanner';
 import { ToastViewport } from './components/ToastViewport';
@@ -7,6 +7,9 @@ import { SearchView } from './components/SearchView';
 import { PortfolioView } from './components/PortfolioView';
 import { MarketplaceView } from './components/MarketplaceView';
 import { ActivityView } from './components/ActivityView';
+import { useWaitlistConfig } from './hooks/useWaitlist';
+import { DISCORD_INVITE_URL } from './lib/discord';
+import { waitlistSiteUrl } from './lib/site';
 import { cx } from './components/ui';
 
 const TABS = [
@@ -71,6 +74,16 @@ function tabFromHash(): TabId {
 export default function App() {
   const [tab, setTab] = useState<TabId>(tabFromHash);
 
+  /*
+   * Whether to offer the waitlist at all, asked of the server rather than
+   * assumed. The flow needs Discord credentials the indexer may not have, and
+   * `/config` is the only thing that knows — so an unconfigured deployment
+   * shows no call to action instead of a button that leads to a 503. It needs
+   * no wallet, is cached for the session and does not retry, so a missing
+   * indexer costs one failed request and hides the link.
+   */
+  const waitlistOpen = useWaitlistConfig().data?.enabled === true;
+
   useEffect(() => {
     const onHashChange = () => setTab(tabFromHash());
     window.addEventListener('hashchange', onHashChange);
@@ -120,6 +133,20 @@ export default function App() {
           </nav>
 
           <div className="flex items-center gap-1.5 sm:gap-2">
+            {/* Also not a tab: the waitlist is a different host. Hidden below
+                `sm` because the docs link already collapses to an icon to fit
+                beside the connect button — a third item does not. The footer
+                and the search hero carry it on a phone instead. */}
+            {waitlistOpen ? (
+              <a
+                href={waitlistSiteUrl()}
+                className="hidden items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-accent-ink transition-colors hover:bg-accent-hover sm:inline-flex"
+              >
+                <Sparkles className="size-4" aria-hidden />
+                Join waitlist
+              </a>
+            ) : null}
+
             {/* Not a tab — this leaves the SPA for the docs site, so it is an
                 anchor rather than a hash-routed button. Icon-only on phones,
                 where the header has no room beside the connect button. */}
@@ -167,13 +194,27 @@ export default function App() {
                 Your identity on Arc. Running on Arc Testnet — names carry no mainnet
                 guarantee.
               </p>
-              <a
-                href={DOCS_URL}
-                className="mt-3 inline-flex items-center gap-1.5 text-xs text-accent hover:underline"
-              >
-                <BookOpen className="size-3.5" aria-hidden />
-                Read the docs
-              </a>
+              <div className="mt-3 flex flex-col items-start gap-2">
+                <a
+                  href={DOCS_URL}
+                  className="inline-flex items-center gap-1.5 text-xs text-accent hover:underline"
+                >
+                  <BookOpen className="size-3.5" aria-hidden />
+                  Read the docs
+                </a>
+                {/* Off-site and third-party, so `noreferrer` rather than just
+                    `noopener`. Not gated on the waitlist config: the server is
+                    worth joining whether or not mainnet signups are open. */}
+                <a
+                  href={DISCORD_INVITE_URL}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1.5 text-xs text-accent hover:underline"
+                >
+                  <MessageCircle className="size-3.5" aria-hidden />
+                  Join our Discord
+                </a>
+              </div>
             </div>
 
             <nav
@@ -196,6 +237,19 @@ export default function App() {
                         </a>
                       </li>
                     ))}
+                    {/* Appended at render rather than added to FOOTER_LINKS:
+                        that const is static, and this entry depends on a query
+                        that has not resolved on first paint. */}
+                    {heading === 'Get started' && waitlistOpen ? (
+                      <li>
+                        <a
+                          href={waitlistSiteUrl()}
+                          className="text-sm text-accent transition-colors hover:underline"
+                        >
+                          Join the waitlist
+                        </a>
+                      </li>
+                    ) : null}
                   </ul>
                 </div>
               ))}

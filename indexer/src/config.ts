@@ -64,6 +64,19 @@ function url(key: string, fallback?: string): string {
   return raw.replace(/\/$/, '');
 }
 
+function optional(key: string): string | null {
+  return process.env[key]?.trim() || null;
+}
+
+function boolean(key: string, fallback: boolean): boolean {
+  const raw = process.env[key]?.trim().toLowerCase();
+  if (!raw) return fallback;
+  if (['1', 'true', 'yes', 'on'].includes(raw)) return true;
+  if (['0', 'false', 'no', 'off'].includes(raw)) return false;
+  problems.push(`${key} must be a boolean ("true" or "false"), got "${raw}"`);
+  return fallback;
+}
+
 const httpRpcUrl = url('RPC_HTTP_URL', process.env.ALCHEMY_HTTP_URL);
 const wsRpcUrl = process.env.RPC_WS_URL?.trim() ?? process.env.ALCHEMY_WSS_URL?.trim() ?? '';
 
@@ -182,7 +195,85 @@ export const config = Object.freeze({
     .split(',')
     .map((value) => value.trim())
     .filter(Boolean),
+
+  /**
+   * Mainnet waitlist.
+   *
+   * Deliberately *not* validated through `required()`. Every other setting in
+   * this file is load-bearing for indexing, and a missing one should stop the
+   * process — but the indexer's actual job (backfill, listener, /api/v1) has no
+   * dependency on Discord. Making these required would mean deploying this
+   * code before the secrets are set in the environment takes down the live read
+   * API, which is a much worse outcome than the waitlist being unavailable.
+   * With anything missing, `isWaitlistEnabled()` is false and those routes
+   * answer 503; `missingWaitlistConfig()` names the gaps at startup so they
+   * show up in the logs rather than being discovered by a user.
+   */
+  waitlist: Object.freeze({
+    discord: Object.freeze({
+      clientId: optional('DISCORD_CLIENT_ID'),
+      clientSecret: optional('DISCORD_CLIENT_SECRET'),
+      /**
+       * Must match a redirect URI registered on the Discord application
+       * exactly — Discord compares the string, not the resolved URL, so a
+       * trailing slash or a different port is a mismatch.
+       */
+      redirectUri: optional('DISCORD_REDIRECT_URI'),
+      botToken: optional('DISCORD_BOT_TOKEN'),
+      guildId: optional('DISCORD_GUILD_ID'),
+      /** Optional — leave unset to skip the role grant entirely. */
+      waitlistRoleId: optional('DISCORD_WAITLIST_ROLE_ID'),
+      /** Surfaced to the UI as the "Join Discord" destination. */
+      inviteUrl: optional('DISCORD_INVITE_URL'),
+      /**
+       * Optional signup notification channel. A webhook URL is a bearer
+       * credential in the shape of a URL — anyone holding it can post to that
+       * channel — so it stays server-side and is never sent to the browser.
+       */
+      webhookUrl: optional('DISCORD_WEBHOOK_URL'),
+      /**
+       * Add non-members to the guild via `guilds.join` rather than asking them
+       * to use the invite. Off by default: it needs the extra `guilds.join`
+       * scope, and someone who authorized an `identify`-only consent screen
+       * has not agreed to be added to a server.
+       */
+      autoJoin: boolean('DISCORD_AUTO_JOIN', false),
+    }),
+
+    /**
+     * Where to send the browser after the OAuth callback. The callback is a
+     * top-level navigation from Discord rather than a fetch, so it cannot
+     * answer with JSON — it has to redirect back into the SPA.
+     */
+    appUrl: optional('APP_URL'),
+
+    /** A session outlives the signature by just enough to finish the flow. */
+    sessionTtlMs: integer('WAITLIST_SESSION_TTL_MINUTES', 60, { min: 5, max: 1440 }) * 60_000,
+    nonceTtlMs: integer('WAITLIST_NONCE_TTL_MINUTES', 10, { min: 1, max: 60 }) * 60_000,
+  }),
 });
+
+/**
+ * Which waitlist settings are absent.
+ *
+ * Returns the list instead of throwing so `index.ts` can log it and carry on
+ * serving chain data. The invite URL and the role are not included — the flow
+ * completes without either.
+ */
+export function missingWaitlistConfig(): string[] {
+  const { discord } = config.waitlist;
+  const missing: string[] = [];
+  if (!discord.clientId) missing.push('DISCORD_CLIENT_ID');
+  if (!discord.clientSecret) missing.push('DISCORD_CLIENT_SECRET');
+  if (!discord.redirectUri) missing.push('DISCORD_REDIRECT_URI');
+  if (!discord.botToken) missing.push('DISCORD_BOT_TOKEN');
+  if (!discord.guildId) missing.push('DISCORD_GUILD_ID');
+  return missing;
+}
+
+export function isWaitlistEnabled(): boolean {
+  return missingWaitlistConfig().length === 0;
+}
 
 export function assertConfigValid(): void {
   if (problems.length > 0) throw new ConfigError(problems);

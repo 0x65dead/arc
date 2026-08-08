@@ -18,7 +18,15 @@ export type ErrorCode =
   | 'bad_request'
   | 'not_found'
   | 'internal'
-  | 'unavailable';
+  | 'unavailable'
+  // Added for the waitlist routes, which unlike the chain-data ones can fail
+  // in ways a client is expected to handle differently: re-sign (unauthorized),
+  // show a specific message (conflict), or back off (rate_limited). Collapsing
+  // these into bad_request would mean the frontend parsing message strings to
+  // tell them apart.
+  | 'unauthorized'
+  | 'conflict'
+  | 'rate_limited';
 
 export class ApiError extends Error {
   constructor(

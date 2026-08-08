@@ -22,4 +22,11 @@ export const queryKeys = {
 
   records: (label: string) => ['records', label] as const,
   primaryName: (address: string | undefined) => ['primary-name', address?.toLowerCase() ?? null] as const,
+
+  waitlistConfig: ['waitlist', 'config'] as const,
+  // Keyed by address rather than by session: the status route is readable
+  // without a token, and keying by token would drop the cached entry every
+  // time a session is renewed.
+  waitlistStatus: (address: string | undefined) =>
+    ['waitlist', 'status', address?.toLowerCase() ?? null] as const,
 } as const;
