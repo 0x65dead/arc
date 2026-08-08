@@ -39,7 +39,14 @@
   --radius-card: 16px;
 }
 
-* {
+/* Tailwind v4 defaults `border-color` to currentColor, so this restores the
+   design token as the app-wide default.
+
+   Scoped to the app tree: RainbowKit portals its modal into <body>, outside
+   #root, and paints its own dividers. `:where()` contributes no specificity, so
+   this stays at (0,0,0) and any `border-*` utility class still wins — writing
+   `#root *` directly would outrank every one of them. */
+:where(#root) * {
   border-color: var(--color-border);
 }
 
@@ -96,9 +103,18 @@ h1, h2, h3, h4, .font-display {
   background: var(--color-border-strong);
 }
 
-/* Honour the OS setting instead of animating regardless. */
+/* Honour the OS setting instead of animating regardless.
+
+   Deliberately unscoped, so it covers RainbowKit's modal too: RainbowKit does
+   not suppress its own motion under this setting (its dialog still animates for
+   0.15s/0.35s with `prefers-reduced-motion: reduce` active), and its portal
+   mounts outside #root, so anything scoped to the app would miss it. Verified
+   that snapping those animations leaves the modal fully rendered rather than
+   frozen part-way — it opens instantly, which is the point. */
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
+  *,
+  *::before,
+  *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;

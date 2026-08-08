@@ -28,7 +28,13 @@ export function ToastViewport() {
 
   return (
     <div
-      className="pointer-events-none fixed inset-x-0 bottom-0 z-50 flex flex-col items-center gap-2 p-4 sm:items-end"
+      /*
+       * One above RainbowKit's 2147483646. Transaction status has to stay
+       * visible while a RainbowKit modal is open — at z-50 a toast fired by a
+       * network switch rendered behind the modal, so the flow looked stalled.
+       * The container is pointer-events-none, so it never blocks the modal.
+       */
+      className="pointer-events-none fixed inset-x-0 bottom-0 z-[2147483647] flex flex-col items-center gap-2 p-4 sm:items-end"
       aria-live="polite"
       aria-atomic="false"
     >

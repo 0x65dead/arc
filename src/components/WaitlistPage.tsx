@@ -3,6 +3,8 @@ import { ArrowUpRight } from 'lucide-react';
 import { ConnectButton } from './ConnectButton';
 import { ToastViewport } from './ToastViewport';
 import { WaitlistView } from './WaitlistView';
+import { XIcon } from './XIcon';
+import { X_HANDLE, X_PROFILE_URL } from '../lib/social';
 
 /**
  * The standalone shell for `join.<domain>`.
@@ -57,13 +59,27 @@ export function WaitlistPage() {
             Joining the waitlist is free and off-chain. Signing costs no gas and cannot move
             your funds or your names.
           </p>
-          <a
-            href={mainSiteUrl()}
-            className="inline-flex shrink-0 items-center gap-1.5 text-xs text-accent hover:underline"
-          >
-            Go to arc names
-            <ArrowUpRight className="size-3.5" aria-hidden />
-          </a>
+          {/* Two off-site links in a shell whose whole point is not having nav.
+              Both are footer-only and neither costs the flow: X opens in a new
+              tab, so a half-signed-up user keeps their tab, and mainnet gets
+              announced there — this is where someone waiting will look. */}
+          <div className="flex shrink-0 items-center gap-4">
+            <a
+              href={X_PROFILE_URL}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1.5 text-xs text-accent hover:underline"
+            >
+              <XIcon className="size-3" />@{X_HANDLE}
+            </a>
+            <a
+              href={mainSiteUrl()}
+              className="inline-flex items-center gap-1.5 text-xs text-accent hover:underline"
+            >
+              Go to arc names
+              <ArrowUpRight className="size-3.5" aria-hidden />
+            </a>
+          </div>
         </div>
       </footer>
 

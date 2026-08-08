@@ -110,7 +110,21 @@ export default defineConfig({
 
     search: { provider: 'local' },
 
-    socialLinks: [{ icon: 'github', link: 'https://github.com/arcnames' }],
+    // The X entry passes an inline `svg` rather than the `icon: 'x'` shorthand.
+    // The shorthand resolves through api.iconify.design at runtime whenever the
+    // build has not inlined the mask, which puts a docs-site nav icon behind a
+    // third-party request; the path is small enough to just carry. Same mark as
+    // `src/components/XIcon.tsx` — keep the two in step.
+    socialLinks: [
+      { icon: 'github', link: 'https://github.com/arcnames' },
+      {
+        icon: {
+          svg: '<svg role="img" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><title>X</title><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>',
+        },
+        link: 'https://x.com/arcnaming',
+        ariaLabel: 'Arc Names on X',
+      },
+    ],
 
     footer: {
       message: 'Arc Names runs on Arc Testnet. Names carry no mainnet guarantee.',
