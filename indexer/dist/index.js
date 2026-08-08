@@ -5,6 +5,7 @@ import { runMigrations } from './db/migrate.js';
 import { runBackfill } from './ingest/backfill.js';
 import { startListener } from './ingest/listener.js';
 import { createApiServer } from './api/server.js';
+import { pruneExpired } from './waitlist/repository.js';
 const log = createLogger('startup');
 /**
  * Entry point.
@@ -37,7 +38,25 @@ async function main() {
     const reconcile = setInterval(() => {
         runBackfill().catch((error) => log.error('reconcile pass failed', { error }));
     }, config.reconcileIntervalMs);
-    installShutdownHandlers({ server, listener, reconcile });
+    /**
+     * Expire waitlist challenges and sessions.
+     *
+     * Both tables are append-mostly and nothing else ever deletes from them —
+     * every abandoned signing prompt leaves a row that no query will match
+     * again. Hourly is far more often than necessary for the row count, and is
+     * chosen instead so that an expired session stops being a row in the
+     * database shortly after it stops being useful.
+     */
+    const prune = setInterval(() => {
+        pruneExpired()
+            .then((removed) => {
+            if (removed > 0)
+                log.debug('pruned expired waitlist rows', { removed });
+        })
+            .catch((error) => log.warn('waitlist prune failed', { error }));
+    }, 60 * 60 * 1000);
+    prune.unref();
+    installShutdownHandlers({ server, listener, reconcile, prune });
 }
 /**
  * Graceful shutdown.
@@ -54,6 +73,7 @@ function installShutdownHandlers(resources) {
         shuttingDown = true;
         log.info('shutting down', { signal });
         clearInterval(resources.reconcile);
+        clearInterval(resources.prune);
         const forceExit = setTimeout(() => {
             log.warn('shutdown timed out — exiting');
             process.exit(1);
