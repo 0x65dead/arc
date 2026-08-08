@@ -9,6 +9,8 @@ import { MarketplaceView } from './components/MarketplaceView';
 import { ActivityView } from './components/ActivityView';
 import { useWaitlistConfig } from './hooks/useWaitlist';
 import { DISCORD_INVITE_URL } from './lib/discord';
+import { X_HANDLE, X_PROFILE_URL } from './lib/social';
+import { XIcon } from './components/XIcon';
 import { waitlistSiteUrl } from './lib/site';
 import { cx } from './components/ui';
 
@@ -213,6 +215,15 @@ export default function App() {
                 >
                   <MessageCircle className="size-3.5" aria-hidden />
                   Join our Discord
+                </a>
+                <a
+                  href={X_PROFILE_URL}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1.5 text-xs text-accent hover:underline"
+                >
+                  <XIcon className="size-3" />
+                  Follow @{X_HANDLE} on X
                 </a>
               </div>
             </div>

@@ -149,6 +149,26 @@ export default defineConfig({
     tailwindcss(),
     serveBuiltDocs(),
   ],
+  /*
+   * Split the vendor code that changes on a different cadence from the app.
+   *
+   * Adding RainbowKit and the WalletConnect SDK to a single unsplit bundle took
+   * it well past Vite's 500 kB warning, and `vercel.json` caches /assets/*
+   * immutably — so without this every app deploy also re-downloads React, viem
+   * and the whole wallet stack. Wallet code is the largest and least-changing
+   * piece, which makes it the one most worth isolating.
+   */
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          react: ['react', 'react-dom'],
+          wallet: ['@rainbow-me/rainbowkit', 'wagmi', 'viem'],
+        },
+      },
+    },
+  },
+
   server: {
     host: '0.0.0.0',
     port: 3000,

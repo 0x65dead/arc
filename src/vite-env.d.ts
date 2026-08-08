@@ -10,6 +10,10 @@ interface ImportMetaEnv {
   readonly VITE_ALCHEMY_API_KEY?: string;
   readonly VITE_ARC_RPC_URL?: string;
   readonly VITE_INDEXER_API_URL?: string;
+  /** WalletConnect Cloud project ID. Without it only injected wallets are offered. */
+  readonly VITE_WALLETCONNECT_PROJECT_ID?: string;
+  /** Set to `waitlist` to mount the waitlist shell regardless of hostname. */
+  readonly VITE_SITE_MODE?: string;
   readonly VITE_REGISTRY_ADDRESS?: string;
   readonly VITE_REGISTRAR_ADDRESS?: string;
   readonly VITE_RESOLVER_ADDRESS?: string;
