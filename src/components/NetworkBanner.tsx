@@ -2,9 +2,10 @@ import { AlertTriangle, CloudOff } from 'lucide-react';
 import { useAccount, useSwitchChain } from 'wagmi';
 import { ARC_CHAIN_ID, arcTestnet, rpcLacksCors } from '../config/chain';
 import type { IndexerSyncStatus } from '../lib/indexer';
-import { isRpcUnreachable } from '../lib/errors';
+import { describeError, isRpcUnreachable, isUserRejection } from '../lib/errors';
 import { useProtocolParams } from '../hooks/useProtocolParams';
 import { useSyncStatus } from '../hooks/useStats';
+import { useToasts } from '../hooks/useToasts';
 import { Button } from './ui';
 
 /**
@@ -22,6 +23,7 @@ export function NetworkBanner() {
   const { switchChain, isPending } = useSwitchChain();
   const { data: sync, isError: syncFailed } = useSyncStatus();
   const { isError: rpcFailed, error: rpcError } = useProtocolParams();
+  const toasts = useToasts();
 
   const wrongChain = isConnected && chainId !== ARC_CHAIN_ID;
   const staleIndex = sync ? !sync.healthy : false;
@@ -56,7 +58,22 @@ export function NetworkBanner() {
             size="sm"
             variant="secondary"
             loading={isPending}
-            onClick={() => switchChain({ chainId: ARC_CHAIN_ID })}
+            onClick={() =>
+              // `switchChain` swallows its own rejection, so without this the
+              // button spins, settles, and nothing at all happens when a wallet
+              // refuses — which is the normal outcome in a mobile in-app
+              // browser, where programmatic switching often isn't supported.
+              switchChain(
+                { chainId: ARC_CHAIN_ID },
+                {
+                  onError: (error) => {
+                    console.warn('[arc] Chain switch from banner failed', error);
+                    if (isUserRejection(error)) return;
+                    toasts.push('error', describeError(error));
+                  },
+                },
+              )
+            }
           >
             Switch to {arcTestnet.name}
           </Button>

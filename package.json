@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview --port 3000",
     "lint": "tsc --noEmit",
+    "verify:wallets": "node scripts/verify-wallets.mjs",
     "docs:dev": "vitepress dev docs --host 0.0.0.0 --port 3100",
     "docs:build": "vitepress build docs",
     "docs:preview": "vitepress preview docs --port 3100",

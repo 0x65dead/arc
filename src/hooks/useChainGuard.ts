@@ -1,7 +1,7 @@
 import { useCallback } from 'react';
 import { useAccount, useSwitchChain } from 'wagmi';
 import { ARC_CHAIN_ID } from '../config/chain';
-import { WrongChainError } from '../lib/errors';
+import { WrongChainError, isUserRejection } from '../lib/errors';
 
 /**
  * Guarantees the wallet is on Arc Testnet before a write is signed.
@@ -24,10 +24,26 @@ export function useChainGuard() {
     if (chainId === ARC_CHAIN_ID) return;
     try {
       await switchChainAsync({ chainId: ARC_CHAIN_ID });
-    } catch {
-      // The wallet refused, or doesn't support programmatic switching (common
-      // in mobile in-app browsers). Raise a typed error so callers can show
-      // one clear instruction instead of a decoded RPC failure.
+    } catch (error) {
+      // Kept for the console; the user gets one of the sentences below.
+      console.warn('[arc] Chain switch to Arc Testnet failed', error);
+
+      // Declining the wallet's network prompt is a decision, not a failure.
+      // Rethrowing it unchanged lets `useTx` recognise it and stay silent —
+      // wrapping it in `WrongChainError` turned a cancelled switch into an
+      // error toast.
+      if (isUserRejection(error)) throw error;
+
+      // The wallet has no programmatic switching at all — the norm inside a
+      // mobile wallet's in-app browser. `describeError` says so specifically,
+      // which is more use than the generic instruction below.
+      if (error instanceof Error && error.name === 'SwitchChainNotSupportedError') {
+        throw error;
+      }
+
+      // Anything else: the wallet refused for a reason it did not explain.
+      // Raise a typed error so callers can show one clear instruction instead
+      // of a decoded RPC failure.
       throw new WrongChainError(chainId);
     }
   }, [chainId, switchChainAsync]);

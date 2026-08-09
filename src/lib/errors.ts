@@ -117,6 +117,46 @@ function messageForReason(reason: string): string | undefined {
 }
 
 /**
+ * wagmi's connector failures → human message.
+ *
+ * These do not extend viem's `BaseError` — they come from `@wagmi/core`'s own
+ * hierarchy — so the viem branch in `describeError` never sees them and they
+ * used to reach the user as a raw multi-line developer message ("Connector not
+ * found. Version: wagmi@2.19.5"). Every case here is reachable from the connect
+ * and chain-switch paths rather than from a contract call.
+ *
+ * Matched on `name` rather than `instanceof`. Each of these classes pins its
+ * own `name` in the constructor, so the string is as stable as the class; and
+ * `ConnectorNotConnectedError` is not re-exported from wagmi's root at all, so
+ * `instanceof` would mean importing `@wagmi/core` — a transitive dependency
+ * this app does not declare and must not start relying on directly.
+ */
+const CONNECTOR_MESSAGES: Record<string, string> = {
+  // The wallet has no programmatic chain switching at all, which is the norm
+  // inside a mobile wallet's in-app browser.
+  SwitchChainNotSupportedError:
+    'This wallet cannot switch networks from a website. Select Arc Testnet in the wallet itself, then try again.',
+  // `switchChain` was asked for a chain the wagmi config does not declare. A
+  // bug rather than a user error, so it says what to do without blaming them.
+  ChainNotConfiguredError: 'That network is not configured in this app. Reload and try again.',
+  // The extension or in-app provider vanished — usually a locked or disabled
+  // extension, or a wallet uninstalled mid-session.
+  ProviderNotFoundError:
+    "Your wallet isn't responding. Unlock it, or reload the page and reconnect.",
+  ConnectorNotFoundError:
+    'That wallet is unavailable in this browser. Pick another wallet, or open this site in your wallet’s browser.',
+  ConnectorNotConnectedError: 'Your wallet is no longer connected. Connect it again to continue.',
+  ConnectorAccountNotFoundError:
+    'That account is no longer available in your wallet. Reconnect and try again.',
+  ConnectorChainMismatchError:
+    'Your wallet and this app disagree about the current network. Reload the page, then try again.',
+};
+
+function describeConnectorError(error: unknown): string | undefined {
+  return error instanceof Error ? CONNECTOR_MESSAGES[error.name] : undefined;
+}
+
+/**
  * Turns anything thrown by a write path into a sentence worth showing a user.
  *
  * Order matters: the typed errors this app raises itself are checked before
@@ -129,6 +169,13 @@ export function describeError(error: unknown): string {
   if (error instanceof WrongChainError) {
     return 'Switch your wallet to Arc Testnet to continue.';
   }
+
+  // Before the viem branch: a rejected chain switch arrives as a viem
+  // `UserRejectedRequestError` and is caught there, but the rest of wagmi's
+  // connector errors are not viem errors at all and would fall through to the
+  // raw-message tail.
+  const connectorMessage = describeConnectorError(error);
+  if (connectorMessage) return connectorMessage;
   if (error instanceof TxRevertedError) {
     return 'The transaction was mined but reverted, so nothing changed (gas was still spent). Check it on ArcScan for the reason.';
   }
@@ -144,10 +191,9 @@ export function describeError(error: unknown): string {
     return "Can't reach the Arc network right now. Check your connection and try again.";
   }
 
-  if (error instanceof BaseError) {
-    const rejection = error.walk((e) => e instanceof UserRejectedRequestError);
-    if (rejection) return 'You rejected the request in your wallet.';
+  if (isUserRejection(error)) return 'You rejected the request in your wallet.';
 
+  if (error instanceof BaseError) {
     const reverted = error.walk((e) => e instanceof ContractFunctionRevertedError);
     if (reverted instanceof ContractFunctionRevertedError) {
       const reason = reverted.data?.errorName ?? reverted.reason;
@@ -158,9 +204,20 @@ export function describeError(error: unknown): string {
       }
     }
 
+    // After the revert branch, not before: a call signed through a
+    // WalletConnect-connected wallet can carry the relay's name somewhere in
+    // its message chain, and the revert reason is the more specific answer.
+    if (isWalletConnectFailure(error)) {
+      return "Couldn't reach WalletConnect. Check your connection, then try connecting again.";
+    }
+
     const mapped = messageForReason(error.shortMessage ?? error.message ?? '');
     if (mapped) return mapped;
     return error.shortMessage || truncate(error.message);
+  }
+
+  if (isWalletConnectFailure(error)) {
+    return "Couldn't reach WalletConnect. Check your connection, then try connecting again.";
   }
 
   if (error instanceof Error) {
@@ -172,12 +229,50 @@ export function describeError(error: unknown): string {
   return truncate(String(error));
 }
 
-/** True when the user simply cancelled — callers usually stay silent for these. */
+/**
+ * True when the user simply cancelled — callers usually stay silent for these.
+ *
+ * Not every wallet routes a rejection through viem. The WalletConnect relay and
+ * the MetaMask and Coinbase SDKs each surface their own object carrying EIP-1193
+ * code 4001, and RainbowKit's own connect path additionally special-cases the
+ * string below, so a cancelled connection would otherwise be reported as a
+ * failure.
+ *
+ * `useTx` drops its toast entirely when this returns true, so a false positive
+ * is the worst outcome available here: a transaction that genuinely failed
+ * would vanish without a word. Hence the revert guard — the loose message match
+ * at the end is a heuristic over text this app does not control, and a mined
+ * revert is never a cancellation no matter what the reason string says.
+ */
 export function isUserRejection(error: unknown): boolean {
+  if (error instanceof TxRevertedError) return false;
   if (error instanceof BaseError) {
-    return Boolean(error.walk((e) => e instanceof UserRejectedRequestError));
+    if (error.walk((e) => e instanceof UserRejectedRequestError)) return true;
+    if (error.walk((e) => e instanceof ContractFunctionRevertedError)) return false;
   }
-  return false;
+  if (typeof error === 'object' && error !== null) {
+    const { code, name } = error as { code?: unknown; name?: unknown };
+    if (code === 4001 || name === 'UserRejectedRequestError') return true;
+  }
+  const message = error instanceof Error ? error.message : '';
+  return /user rejected|user denied|user cancell?ed|request reset/i.test(message);
+}
+
+/**
+ * True when the WalletConnect relay itself failed, rather than the user or the
+ * wallet.
+ *
+ * Worth separating because the fix is different: the connection never reached a
+ * wallet at all, so "try again" is the right advice and "your wallet rejected
+ * it" would be wrong. `Unauthorized: origin not allowed` is the one to watch
+ * for in development — it means the project ID is real but this origin is not
+ * on its allowlist in the WalletConnect Cloud dashboard.
+ */
+export function isWalletConnectFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /walletconnect|relay\.walletconnect|proposal expired|no matching key|session topic doesn't exist|origin not allowed/i.test(
+    message,
+  );
 }
 
 function truncate(message: string, max = 160): string {
