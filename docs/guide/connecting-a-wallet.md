@@ -26,18 +26,27 @@ native token or the 6-decimal ERC-20, and they convert between the two. See
 
 ## Connecting
 
-Press **Connect** in the app header. A wallet picker opens, listing the wallets you can use:
-browser extensions it detects as installed, plus Rainbow, Coinbase Wallet and **WalletConnect**
-for everything else. Pick one and approve the connection request in the wallet.
+Press **Connect** in the app header. A wallet picker opens with two groups:
+
+- **Installed** — every browser extension the app detects, listed by its own name and icon.
+- **Popular** and **More** — Rainbow, Base, MetaMask, WalletConnect, Coinbase Wallet, Rabby,
+  OKX, Bitget and Trust. **WalletConnect** is the catch-all: pick it to reach any other
+  compatible wallet.
+
+Pick one and approve the connection request in the wallet.
 
 If you have no wallet at all, the picker's **New to Ethereum wallets?** link explains what a wallet
-is and where to get one.
+is and where to get one. Choosing a wallet you don't have installed shows you where to get it
+rather than failing.
 
 ### On a phone
 
-Choose **WalletConnect**. On a phone browser this offers to open your wallet app directly; on a
-desktop browser it shows a QR code to scan with the wallet app on your phone. Either way the app
-and the wallet stay linked until you disconnect.
+The picker shows the same wallets, and tapping one opens that wallet's app directly by deep link,
+then returns you to the browser once you approve. If you're already browsing inside a wallet app,
+that wallet appears in the list and connects without leaving the app.
+
+On a desktop browser, choosing a mobile-only wallet shows a QR code to scan with the phone
+instead. Either way the app and the wallet stay linked until you disconnect.
 
 ## Adding the network
 
@@ -103,9 +112,13 @@ A hardware wallet is worth it for a name you care about. See
 
 ::: tip Running your own copy?
 WalletConnect needs a free project ID from [Reown Cloud](https://cloud.reown.com). Set it as
-`VITE_WALLETCONNECT_PROJECT_ID` in `.env`. Without it the picker falls back to offering only
-installed browser extensions — which means no mobile path, so set it before deploying anywhere
-people will use a phone.
+`VITE_WALLETCONNECT_PROJECT_ID` in `.env`.
+
+Without it, the wallets that reach you through the WalletConnect relay — Rainbow, WalletConnect,
+OKX, Bitget, Trust, and MetaMask on a desktop with no MetaMask extension — are hidden rather than
+listed and then failing to connect. Coinbase, Base, an installed Rabby and any extension the
+browser announces still work, so a desktop is usable; but there is no QR-code path and no way to
+reach a phone wallet, so set it before deploying anywhere people will use a phone.
 :::
 
 ## Checking the connection

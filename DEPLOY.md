@@ -241,18 +241,26 @@ the dashboard is not overriding it:
 if the docs are missing from a deploy, this is why.
 
 **Environment variables.** The frontend only ships `VITE_`-prefixed vars, and
-it needs exactly one, because the contract addresses are compiled in
+it needs two, because the contract addresses are compiled in
 (`src/config/contracts.ts`) and the API is same-origin:
 
 | Variable | Value | Why |
 |---|---|---|
 | `VITE_ALCHEMY_API_KEY` | your Alchemy key | Required. Without it the RPC falls back to `rpc.testnet.arc.network`, which sends no CORS headers — **every on-chain read fails in the browser**: search shows nothing, the portfolio is empty, registration cannot price a name. The app detects this and says so in a banner, but it is not usable. |
+| `VITE_WALLETCONNECT_PROJECT_ID` | 32-char hex from [Reown Cloud](https://cloud.reown.com), free | Required for mobile. Without it the connect modal hides every wallet that reaches the user through the WalletConnect relay — Rainbow, WalletConnect, OKX, Bitget, Trust, and MetaMask on a desktop with no extension. Coinbase, Base and installed extensions still work, so a desktop is usable, but **there is no QR code and no phone path at all**. The build succeeds either way; the console says which wallets were dropped. |
 
-⚠️ **This one interacts with the `.env` cleanup in §6.** The key currently
-reaches Vercel only because the root `.env` is committed to the repo. The
-moment you `git rm --cached .env`, the next build has no key and the site
+Both are public — they ship in the bundle like every `VITE_` var. Restrict them
+by origin in the Alchemy and WalletConnect Cloud dashboards rather than
+expecting them to stay secret. If wallet connections fail with `Unauthorized:
+origin not allowed`, the WalletConnect allowlist is what to fix.
+
+⚠️ **`VITE_ALCHEMY_API_KEY` interacts with the `.env` cleanup in §6.** The key
+currently reaches Vercel only because the root `.env` is committed to the repo.
+The moment you `git rm --cached .env`, the next build has no key and the site
 breaks in exactly the way above — with a green build and no error. **Set
-`VITE_ALCHEMY_API_KEY` in Vercel first, then untrack the file.**
+`VITE_ALCHEMY_API_KEY` in Vercel first, then untrack the file.** Set
+`VITE_WALLETCONNECT_PROJECT_ID` there at the same time: it has never been in
+`.env`, so it must come from Vercel regardless.
 
 Optional: `VITE_ARC_RPC_URL` overrides the RPC endpoint outright (a self-hosted
 node or CORS-enabled proxy), and `VITE_{REGISTRY,CONTROLLER,REGISTRAR,RESOLVER,
